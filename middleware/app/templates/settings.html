@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Connection Settings — Vault DB Access Admin</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    fieldset { margin-bottom: 1.5rem; border: 1px solid #ccc; border-radius: 6px; }
+    label { display: block; margin: 0.4rem 0; }
+    input { width: 100%; padding: 0.3rem; box-sizing: border-box; }
+    button { padding: 0.4rem 0.9rem; cursor: pointer; margin-top: 0.5rem; }
+    .message { background: #eef8ee; border: 1px solid #7bc47f; padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; }
+    .danger { color: #a33; }
+    nav a { margin-right: 1rem; }
+  </style>
+</head>
+<body>
+  <nav><a href="/">← Grants</a></nav>
+  <h1>Connection Settings</h1>
+  <p>Logged in as <strong>{{ username }}</strong></p>
+
+  {% if message %}
+  <div class="message">{{ message }}</div>
+  {% endif %}
+
+  <fieldset>
+    <legend>PostgreSQL admin connection</legend>
+    <form method="post" action="/settings/postgres">
+      <label>Username <input type="text" name="username" placeholder="postgres" required></label>
+      <label>Password <input type="password" name="password" required></label>
+      <button type="submit">Save</button>
+    </form>
+    <form method="post" action="/settings/postgres/rotate">
+      <button type="submit" class="danger">Rotate root credential now</button>
+    </form>
+    <p><small>After rotation, Vault generates and keeps a new random password itself —
+       nobody, including this admin panel, can read it back.</small></p>
+  </fieldset>
+
+  <fieldset>
+    <legend>ClickHouse admin connection</legend>
+    <form method="post" action="/settings/clickhouse">
+      <label>Username <input type="text" name="username" placeholder="vaultadmin" required></label>
+      <label>Password <input type="password" name="password" required></label>
+      <button type="submit">Save</button>
+    </form>
+    <form method="post" action="/settings/clickhouse/rotate">
+      <button type="submit" class="danger">Rotate root credential now</button>
+    </form>
+  </fieldset>
+</body>
+</html>

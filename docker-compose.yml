@@ -1,0 +1,106 @@
+networks:
+  vault-db-access:
+    driver: bridge
+
+volumes:
+  vault-data:
+  vault-plugins:
+  postgres-data:
+  clickhouse-data:
+
+services:
+  postgres-test:
+    image: postgres:16
+    container_name: vdba-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_DB: appdb
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - vault-db-access
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clickhouse-test:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: vdba-clickhouse
+    restart: unless-stopped
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse-init/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./clickhouse-init/vaultadmin.xml:/etc/clickhouse-server/users.d/vaultadmin.xml:ro
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - vault-db-access
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  vault:
+    build:
+      context: ./vault
+    container_name: vdba-vault
+    restart: unless-stopped
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+      # Dev/test default: plain HTTP on the internal docker network. For production,
+      # override this to enable TLS -- e.g.:
+      #   {"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":false,
+      #     "tls_cert_file":"/vault/tls/cert.pem","tls_key_file":"/vault/tls/key.pem"}},
+      #    "api_addr":"https://vault.example.com:8200"}
+      # and mount your cert/key into /vault/tls.
+      VAULT_LOCAL_CONFIG: >-
+        {"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"api_addr":"http://0.0.0.0:8200"}
+    volumes:
+      - vault-data:/vault/file
+      - vault-plugins:/vault/plugins
+      - ./vault/config.hcl:/vault/config/config.hcl:ro
+    command: ["server"]
+    ports:
+      - "8200:8200"
+    networks:
+      - vault-db-access
+
+  middleware:
+    build:
+      context: ./middleware
+    container_name: vdba-middleware
+    restart: unless-stopped
+    environment:
+      VAULT_ADDR: http://vdba-vault:8200
+      SESSION_SECRET_KEY: ${SESSION_SECRET_KEY}
+      POSTGRES_HOST: vdba-postgres
+      POSTGRES_PORT: "5432"
+      CLICKHOUSE_HOST: vdba-clickhouse
+      CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_HTTP_PORT: "8123"
+      # POSTGRES_SUPERUSER_PASSWORD / CLICKHOUSE_VAULTADMIN_PASSWORD are only read by
+      # `python -m app.first_time_setup` (one-off), never by the running app. Pass them
+      # on the `docker compose run` command for that step, not here, once you're past
+      # initial bring-up (see README.md).
+      POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-}
+      CLICKHOUSE_VAULTADMIN_PASSWORD: ${CLICKHOUSE_VAULTADMIN_PASSWORD:-}
+    volumes:
+      - ./secrets:/vault-secrets
+      - vault-plugins:/vault-plugins:ro
+    depends_on:
+      - vault
+      - postgres-test
+      - clickhouse-test
+    ports:
+      - "8000:8000"
+    networks:
+      - vault-db-access

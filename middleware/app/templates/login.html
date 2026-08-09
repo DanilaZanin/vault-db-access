@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Vault DB Access Admin — Login</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 400px; margin: 4rem auto; padding: 0 1rem; color: #222; }
+    label { display: block; margin: 0.75rem 0 0.25rem; }
+    input { width: 100%; padding: 0.4rem; box-sizing: border-box; }
+    button { margin-top: 1rem; padding: 0.5rem 1rem; cursor: pointer; }
+    .error { background: #fdeeee; border: 1px solid #e08787; padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; }
+    .hint { color: #666; font-size: 0.85rem; margin-top: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Vault DB Access Admin</h1>
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+  <form method="post" action="/login">
+    <label>Vault username <input type="text" name="username" required autofocus></label>
+    <label>Vault password <input type="password" name="password" required></label>
+    <button type="submit">Log in</button>
+  </form>
+  <p class="hint">Log in with your own Vault account (auth/userpass). Only accounts with the
+     <code>db-access-admin</code> Vault policy can issue or manage grants here.</p>
+</body>
+</html>

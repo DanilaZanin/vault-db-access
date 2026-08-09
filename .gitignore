@@ -1,0 +1,7 @@
+.env
+vault-init.json
+*.tar
+__pycache__/
+.pytest_cache/
+secrets/
+dist/
