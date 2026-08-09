@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Vault DB Access Admin</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    fieldset { margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 6px; }
+    label { display: block; margin: 0.25rem 0; }
+    .row { display: flex; gap: 2rem; flex-wrap: wrap; }
+    .box { border: 1px solid #ccc; border-radius: 6px; padding: 0.75rem; min-width: 220px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; font-size: 0.9rem; }
+    .result { background: #eef8ee; border: 1px solid #7bc47f; padding: 1rem; border-radius: 6px; margin: 1rem 0; }
+    .error { background: #fdeeee; border: 1px solid #e08787; padding: 1rem; border-radius: 6px; margin: 1rem 0; }
+    code { background: #f4f4f4; padding: 2px 4px; border-radius: 3px; }
+    button { padding: 0.4rem 0.9rem; cursor: pointer; }
+    nav { display: flex; justify-content: space-between; align-items: center; }
+    nav a { margin-right: 1rem; }
+    .refresh-btn { font-size: 0.8rem; padding: 0.15rem 0.5rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    <div><a href="/">Grants</a><a href="/settings">Connection settings</a></div>
+    <div>
+      {{ username }}
+      <form method="post" action="/logout" style="display:inline">
+        <button type="submit">Log out</button>
+      </form>
+    </div>
+  </nav>
+  <h1>Vault DB Access Admin</h1>
+
+  {% if error %}
+  <div class="error"><strong>Error:</strong> {{ error }}</div>
+  {% endif %}
+
+  {% if result %}
+  <div class="result">
+    <strong>Grant issued</strong> for <strong>{{ result.requested_for }}</strong>:
+    <code>{{ result.role_name }}</code> (ttl {{ result.ttl_seconds }}s)
+    {% if result.username %}
+      <p>Login: <code>{{ result.username }}</code><br>Password: <code>{{ result.password }}</code></p>
+      <p>Connect directly with these credentials.</p>
+    {% else %}
+      <p>Vault token: <code>{{ result.vault_token }}</code></p>
+      <p>Give this to the end user. They log into the Vault UI with this token, then look up the path
+         <code>database/creds/{{ result.role_name }}</code> to see their login/password.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <form method="post" action="/grants">
+    <fieldset>
+      <legend>New grant</legend>
+
+      <label>Issued to (who receives this account): <input type="text" name="requested_for" placeholder="e.g. Ivanov" required></label>
+
+      <label>Database:
+        <select name="db_type" id="db_type" onchange="toggleDb()">
+          <option value="postgres">PostgreSQL</option>
+          <option value="clickhouse">ClickHouse</option>
+        </select>
+      </label>
+
+      <label>Scope:
+        <select name="scope">
+          <option value="database">Whole database</option>
+          <option value="tables">Specific tables</option>
+        </select>
+      </label>
+
+      <div class="row">
+        <div class="box" id="pg-box">
+          <strong>PostgreSQL tables</strong> <button type="button" class="refresh-btn" onclick="refreshTables('postgres')">↻ refresh</button>
+          <div id="pg-tables">
+            {% for t in pg_tables %}
+            <label><input type="checkbox" name="tables" value="{{ t }}"> {{ t }}</label>
+            {% endfor %}
+          </div>
+          <hr>
+          <strong>Commands</strong>
+          {% for c in pg_commands %}
+          <label><input type="checkbox" name="commands" value="{{ c }}"> {{ c }}</label>
+          {% endfor %}
+        </div>
+        <div class="box" id="ch-box" style="display:none">
+          <strong>ClickHouse tables</strong> <button type="button" class="refresh-btn" onclick="refreshTables('clickhouse')">↻ refresh</button>
+          <div id="ch-tables">
+            {% for t in ch_tables %}
+            <label><input type="checkbox" name="tables" value="{{ t }}"> {{ t }}</label>
+            {% endfor %}
+          </div>
+          <hr>
+          <strong>Commands</strong>
+          {% for c in ch_commands %}
+          <label><input type="checkbox" name="commands" value="{{ c }}"> {{ c }}</label>
+          {% endfor %}
+        </div>
+      </div>
+
+      <label><input type="checkbox" name="allow_create" value="true"> Allow creating new tables
+        (grantee gets full rights, including drop, on tables they create themselves)</label>
+
+      <label>Credential type:
+        <select name="credential_type">
+          <option value="password">Login + password (shown here directly)</option>
+          <option value="token">Vault token (end user logs into Vault UI)</option>
+        </select>
+      </label>
+
+      <label>Lifetime (seconds): <input type="number" name="ttl_seconds" value="3600" min="30"></label>
+
+      <button type="submit">Issue grant</button>
+    </fieldset>
+  </form>
+
+  <script>
+    function toggleDb() {
+      const isPg = document.getElementById('db_type').value === 'postgres';
+      document.getElementById('pg-box').style.display = isPg ? 'block' : 'none';
+      document.getElementById('ch-box').style.display = isPg ? 'none' : 'block';
+    }
+
+    async function refreshTables(dbType) {
+      const resp = await fetch(`/api/tables/${dbType}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const container = document.getElementById(dbType === 'postgres' ? 'pg-tables' : 'ch-tables');
+      container.innerHTML = '';
+      for (const t of data.tables) {
+        const label = document.createElement('label');
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.name = 'tables';
+        input.value = t;
+        label.appendChild(input);
+        label.append(' ' + t);
+        container.appendChild(label);
+      }
+    }
+  </script>
+
+  <h2>Active grants</h2>
+  <table>
+    <tr><th>Role</th><th>Issued to</th><th>Issued by</th><th>DB</th><th>Scope</th><th>Tables</th><th>Commands</th><th>Cred type</th><th>TTL</th><th>Created</th><th></th></tr>
+    {% for g in grants %}
+    <tr>
+      <td>{{ g.role_name }}</td>
+      <td>{{ g.requested_for }}</td>
+      <td>{{ g.issued_by }}</td>
+      <td>{{ g.db_type }}</td>
+      <td>{{ g.scope }}</td>
+      <td>{{ g.tables | join(', ') }}</td>
+      <td>{{ g.commands | join(', ') }}</td>
+      <td>{{ g.credential_type }}</td>
+      <td>{{ g.ttl_seconds }}s</td>
+      <td>{{ g.created_at }}</td>
+      <td>
+        <form method="post" action="/grants/{{ g.role_name }}/revoke" style="display:inline">
+          <button type="submit">Revoke</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>
