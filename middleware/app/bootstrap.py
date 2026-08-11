@@ -67,6 +67,10 @@ def ensure_clickhouse_plugin(c: hvac.Client) -> None:
 
 
 def ensure_postgres_connection(c: hvac.Client, username: str, password: str) -> None:
+    # Note: Vault's schedule-based root rotation (`rotation_period`/`rotation_schedule`)
+    # is Enterprise-only in Vault 2.0 ("rotation manager capabilities not supported in
+    # Vault Community Edition") -- confirmed while building this, not used here. Manual
+    # rotation via `database/rotate-root/<name>` (see main.py) is unaffected and used instead.
     c.write(
         f"database/config/{config.POSTGRES_CONNECTION_NAME}",
         plugin_name="postgresql-database-plugin",
