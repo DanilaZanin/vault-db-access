@@ -35,6 +35,37 @@ Runs on Vault 2.0.4 (bumped from 1.19.0). What that upgrade actually changed her
   manual rotate-root button (fully OSS, unaffected) is still the only
   rotation path here, same as on 1.19.0.
 
+### Go / dependency security patches (`vault/Dockerfile`)
+
+A Trivy scan flagged `google.golang.org/grpc v1.70.0` (pulled in transitively
+by the ClickHouse plugin's own `go.mod`) as CRITICAL — CVE-2026-33186, an
+HTTP/2 path-validation authorization bypass. Bumped the Go builder image to
+`golang:1.26-bookworm` (latest stable, also matching the Go version Vault
+2.0.4 itself ships with) and pinned the plugin's build to fixed versions of
+every affected transitive dependency:
+
+| Package | Was | Now | Why |
+|---|---|---|---|
+| `google.golang.org/grpc` | v1.70.0 | v1.82.1 | CVE-2026-33186 (CRITICAL); v1.79.3 alone still had GHSA-hrxh-6v49-42gf, so went straight to 1.82.1 |
+| `golang.org/x/net` | v0.48.0 | v0.55.0 | CVE-2026-25681/-27136/-33814/-39821 (HIGH) |
+| `golang.org/x/crypto` | (transitive) | v0.52.0 | CVE-2026-39828/-39829/-39830/-39831/-39832/-39835/-42508/-46595/-46597 (HIGH, SSH auth/DoS bugs) |
+| `golang.org/x/text` | v0.32.0 | v0.39.0 | CVE-2026-56852 (HIGH) |
+| `github.com/docker/docker` | v27.2.1 | v28.5.2 | CVE-2026-34040 (HIGH); latest available Go module tag — see note below |
+
+Verified with `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+aquasec/trivy image --severity HIGH,CRITICAL vault-db-access-vault:latest`
+after rebuilding. Remaining after the bump (not fixable by a version bump,
+confirmed by checking the module proxy directly):
+- `github.com/docker/docker` CVE-2026-41567, CVE-2026-42306 — no fixed
+  version published yet. Trivy's DB lists "29.3.1" as the fix, but that's
+  not an actual published Go module tag (`v28.5.2+incompatible` is the real
+  latest, confirmed via `proxy.golang.org`).
+- `github.com/jackc/pgproto3/v2` CVE-2026-32286 — no fixed version
+  published yet.
+
+Both are transitive test-tooling dependencies of the upstream plugin's own
+`go.mod`, not something imported by this project's runtime code paths.
+
 ## Components
 
 - `vault/` — Vault 2.0.4 image with the `ContentSquare/vault-plugin-database-clickhouse`
