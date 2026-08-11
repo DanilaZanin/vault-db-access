@@ -1,6 +1,6 @@
 # Vault DB Access
 
-Self-service temporary database credentials on top of HashiCorp Vault 1.19's
+Self-service temporary database credentials on top of HashiCorp Vault 2.0's
 Database Secrets Engine. An admin (a real Vault user, not a shared account)
 picks a database (PostgreSQL or ClickHouse), a scope (whole DB or specific
 tables), a set of allowed SQL commands, a lifetime, and how the recipient
@@ -16,9 +16,28 @@ that could show a banner/link inside it ("Custom Messages") is a **Vault
 Enterprise** feature. So there's a separate small admin UI (this app) instead
 of a tab inside Vault. Bookmark both.
 
+## Upgrading to Vault 2.0
+
+Runs on Vault 2.0.4 (bumped from 1.19.0). What that upgrade actually changed here:
+
+- The `hashicorp/vault` base image now runs as the non-root `vault` user by
+  default (1.19.0's didn't) — `vault/Dockerfile` needs `USER root` while it
+  places the ClickHouse plugin binary, then drops back to `USER vault`.
+- The `ContentSquare/vault-plugin-database-clickhouse` plugin (dbplugin v5)
+  still loads and works unmodified on 2.0.4 — verified end-to-end, not
+  assumed.
+- Investigated Vault 2.0's new scheduled root-rotation
+  (`rotation_period`/`rotation_schedule` on `database/config/<name>`) as a
+  possible upgrade to the manual "Rotate root credential now" button. It's
+  **Enterprise-only** — Community Edition rejects it outright with
+  `rotation manager capabilities not supported in Vault Community Edition`
+  (confirmed by actually calling it, not from docs alone). Not adopted; the
+  manual rotate-root button (fully OSS, unaffected) is still the only
+  rotation path here, same as on 1.19.0.
+
 ## Components
 
-- `vault/` — Vault 1.19.0 image with the `ContentSquare/vault-plugin-database-clickhouse`
+- `vault/` — Vault 2.0.4 image with the `ContentSquare/vault-plugin-database-clickhouse`
   plugin built in (Vault has no built-in ClickHouse support).
 - `postgres-init/`, `clickhouse-init/` — sample schemas for local testing.
 - `middleware/` — the FastAPI admin app.
@@ -224,6 +243,18 @@ Kept here so nobody re-discovers these the hard way if they extend this project.
     then it couldn't write to the bind-mounted `./secrets` folder.** Bind
     mounts keep host ownership; `chown -R 1000:1000 ./secrets` (matching the
     container's uid) fixes it, or use a named volume instead.
+
+12. **Upgrading to `hashicorp/vault:2.0.4`, the plugin-build stage failed
+    with `chmod: Operation not permitted`.** The 2.0.4 base image switched to
+    running as the non-root `vault` user by default (1.19.0 ran as root until
+    its entrypoint dropped privileges). Fix: `USER root` before placing/
+    chmod-ing the plugin binary in the Dockerfile, `USER vault` after.
+
+13. **Tried Vault 2.0's scheduled root-rotation (`rotation_period` on
+    `database/config/<name>`), got `rotation manager capabilities not
+    supported in Vault Community Edition`.** It's Enterprise-only, like
+    Custom Messages. Reverted; manual rotation via `database/rotate-root`
+    remains the only (fully OSS) rotation path.
 
 ## Running tests
 

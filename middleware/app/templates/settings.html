@@ -34,7 +34,10 @@
       <button type="submit" class="danger">Rotate root credential now</button>
     </form>
     <p><small>After rotation, Vault generates and keeps a new random password itself —
-       nobody, including this admin panel, can read it back.</small></p>
+       nobody, including this admin panel, can read it back. (Vault's scheduled
+       auto-rotation on a cadence is an Enterprise-only capability — Community
+       Edition returns "rotation manager capabilities not supported" if you try it,
+       confirmed while building this. Manual rotation above is unaffected.)</small></p>
   </fieldset>
 
   <fieldset>
