@@ -1,306 +1,254 @@
-> **v0.1 hardening in progress (branch `hardening-v0.1`).** The stack, setup flow and security model changed
-> completely (AppRole service identity, non-superuser DB connectors, SQLite store, `make up` / `make test`).
-> The README below still describes the previous layout and will be rewritten in phase 3. Until then see
-> `.ai/notes.md` for the current commands, grants and known limits.
+# vault-db-access
 
-# Vault DB Access
+vault-db-access is a small web portal and API that issues temporary PostgreSQL and ClickHouse accounts on top of
+HashiCorp Vault's database secrets engine. An administrator picks a database, tables, commands and a TTL. Vault
+creates the database account, the portal shows the password once, and Vault revokes the account when the TTL ends
+or when an administrator revokes it. The portal never stores credentials.
 
-Self-service temporary database credentials on top of HashiCorp Vault 2.0's
-Database Secrets Engine. An admin (a real Vault user, not a shared account)
-picks a database (PostgreSQL or ClickHouse), a scope (whole DB or specific
-tables), a set of allowed SQL commands, a lifetime, and how the recipient
-should get their credentials (plaintext login+password, or a Vault token they
-use to self-serve via the Vault UI). Vault generates and revokes the actual
-database account; this app only translates the admin's choices into Vault DB
-roles and never sees or stores long-lived secrets itself.
+It is meant for small teams that want short-lived, table-scoped database access (on-call, support, one-off
+analysis) without handing out shared passwords. It needs only Vault OSS / Community Edition: no Enterprise
+feature is used.
 
-## Why no tab inside Vault's own UI?
+Status: v0.1, single node, demo-grade deployment files. Read [SECURITY.md](SECURITY.md) before using it for real.
 
-Vault OSS's UI has no plugin/extension system, and the one native mechanism
-that could show a banner/link inside it ("Custom Messages") is a **Vault
-Enterprise** feature. So there's a separate small admin UI (this app) instead
-of a tab inside Vault. Bookmark both.
+## 60-second demo
 
-## Upgrading to Vault 2.0
+Needs Docker with compose v2, `make`, `openssl` and [uv](https://docs.astral.sh/uv/) (only for the tests).
+`make up` takes about 3 minutes (167 s measured with the image layers cached; the first run also pulls and builds
+images) and the four containers use about 380 MB of RAM together.
 
-Runs on Vault 2.0.4 (bumped from 1.19.0). What that upgrade actually changed here:
+```
+git clone https://github.com/DanilaZanin/vault-db-access && cd vault-db-access
+git checkout hardening-v0.1        # until v0.1.0 is merged to main
+make up
+```
 
-- The `hashicorp/vault` base image now runs as the non-root `vault` user by
-  default (1.19.0's didn't) — `vault/Dockerfile` needs `USER root` while it
-  places the ClickHouse plugin binary, then drops back to `USER vault`.
-- The `ContentSquare/vault-plugin-database-clickhouse` plugin (dbplugin v5)
-  still loads and works unmodified on 2.0.4 — verified end-to-end, not
-  assumed.
-- Investigated Vault 2.0's new scheduled root-rotation
-  (`rotation_period`/`rotation_schedule` on `database/config/<name>`) as a
-  possible upgrade to the manual "Rotate root credential now" button. It's
-  **Enterprise-only** — Community Edition rejects it outright with
-  `rotation manager capabilities not supported in Vault Community Edition`
-  (confirmed by actually calling it, not from docs alone). Not adopted; the
-  manual rotate-root button (fully OSS, unaffected) is still the only
-  rotation path here, same as on 1.19.0.
+`make up` writes `.env` with random secrets, builds the images, starts PostgreSQL, ClickHouse and Vault, runs the
+one-off setup (initialises and unseals Vault, provisions it, revokes the root token) and starts the portal:
 
-### Go / dependency security patches (`vault/Dockerfile`)
+```
+[setup] Vault initialized; unseal key(s) and root token written to /secrets/vault-keys.json (mode 0600)
+[setup] file audit device enabled (/vault/logs/audit.log in the vault container)
+[setup] connection 'postgres' verified: account vault_manager, no superuser-like rights
+[setup] connection 'clickhouse' verified: account vault_manager, no superuser-like rights
+[setup] self-check ok: AppRole login works; policy/config writes are forbidden
+[setup] root token revoked and removed from disk
+portal: http://127.0.0.1:8000  (admin user/password: see VDBA_ADMIN_* in .env)
+```
 
-A Trivy scan flagged `google.golang.org/grpc v1.70.0` (pulled in transitively
-by the ClickHouse plugin's own `go.mod`) as CRITICAL — CVE-2026-33186, an
-HTTP/2 path-validation authorization bypass. Bumped the Go builder image to
-`golang:1.26-bookworm` (latest stable, also matching the Go version Vault
-2.0.4 itself ships with) and pinned the plugin's build to fixed versions of
-every affected transitive dependency:
+Open http://127.0.0.1:8000 and log in with `VDBA_ADMIN_USER` / `VDBA_ADMIN_PASSWORD` from `.env`. The form issues a
+grant; the same thing through the JSON API (this is the real response, password masked here):
 
-| Package | Was | Now | Why |
-|---|---|---|---|
-| `google.golang.org/grpc` | v1.70.0 | v1.82.1 | CVE-2026-33186 (CRITICAL); v1.79.3 alone still had GHSA-hrxh-6v49-42gf, so went straight to 1.82.1 |
-| `golang.org/x/net` | v0.48.0 | v0.55.0 | CVE-2026-25681/-27136/-33814/-39821 (HIGH) |
-| `golang.org/x/crypto` | (transitive) | v0.52.0 | CVE-2026-39828/-39829/-39830/-39831/-39832/-39835/-42508/-46595/-46597 (HIGH, SSH auth/DoS bugs) |
-| `golang.org/x/text` | v0.32.0 | v0.39.0 | CVE-2026-56852 (HIGH) |
-| `github.com/docker/docker` | v27.2.1 | v28.5.2 | CVE-2026-34040 (HIGH); latest available Go module tag — see note below |
+```
+POST /api/grants   {"db_type":"postgres","scope":"tables","tables":["customers"],
+                    "commands":["SELECT"],"ttl_seconds":600,"requested_for":"alice"}
+200  Cache-Control: no-store
+{
+  "grant_id": "vdba_91431696f3",
+  "db_type": "postgres",
+  "scope": "tables",
+  "tables": ["customers"],
+  "commands": ["SELECT"],
+  "requested_for": "alice",
+  "issued_by": "admin",
+  "ttl_seconds": 600,
+  "status": "active",
+  "username": "vdba_91431696f3_ohsthz",
+  "created_at": "2026-10-01T08:27:16Z",
+  "expires_at": "2026-10-01T08:37:16Z",
+  "password": "<shown once>"
+}
+```
 
-Verified with `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
-aquasec/trivy image --severity HIGH,CRITICAL vault-db-access-vault:latest`
-after rebuilding. Remaining after the bump (not fixable by a version bump,
-confirmed by checking the module proxy directly):
-- `github.com/docker/docker` CVE-2026-41567, CVE-2026-42306 — no fixed
-  version published yet. Trivy's DB lists "29.3.1" as the fix, but that's
-  not an actual published Go module tag (`v28.5.2+incompatible` is the real
-  latest, confirmed via `proxy.golang.org`).
-- `github.com/jackc/pgproto3/v2` CVE-2026-32286 — no fixed version
-  published yet.
+The recipient connects (here from inside the Postgres container; a `psql` on the host works the same against
+127.0.0.1:5432):
 
-Both are transitive test-tooling dependencies of the upstream plugin's own
-`go.mod`, not something imported by this project's runtime code paths.
+```
+$ docker compose exec -T -e PGPASSWORD=... postgres psql -h 127.0.0.1 -U vdba_91431696f3_ohsthz -d appdb \
+    -c "SELECT id, name FROM customers"
+ id |     name
+----+---------------
+  1 | Alice Ivanova
+  2 | Boris Petrov
+(2 rows)
 
-## Components
+... -c "SELECT * FROM orders"
+ERROR:  permission denied for table orders
+... -c "INSERT INTO customers (name,email) VALUES ('x','y')"
+ERROR:  permission denied for table customers
+```
 
-- `vault/` — Vault 2.0.4 image with the `ContentSquare/vault-plugin-database-clickhouse`
-  plugin built in (Vault has no built-in ClickHouse support).
-- `postgres-init/`, `clickhouse-init/` — sample schemas for local testing.
-- `middleware/` — the FastAPI admin app.
-  - `app/first_time_setup.py` — **run once**, not on every start (see below).
-  - `app/bootstrap.py` — reusable idempotent Vault-config helpers used by setup.
-  - `app/main.py` — the running app: login, grant issuance, connection settings.
-  - `app/statement_builder.py` — turns (scope, tables, commands) into SQL.
-  - `app/db_introspect.py` — lists live table names for the picker (uses a
-    permanent, minimal-privilege `vault_introspect` account, *not* the
-    rotatable admin/root connection credential).
-- `tests/` — unit tests (`test_statement_builder.py`) and full-stack
-  integration tests (`test_integration.py`) that run against the real stack.
+After `POST /api/grants/vdba_91431696f3/revoke` (an admin clicking "Revoke" does the same) the account is gone:
+
+```
+200 revoked
+... -c "SELECT id, name FROM customers"
+psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  role "vdba_91431696f3_ohsthz" does not exist
+```
+
+API clients must send `Origin: http://127.0.0.1:8000` and an `X-CSRF-Token` taken from `GET /api/session` on every
+POST. Reset everything with `make down` (it deletes the volumes and `./secrets`).
+
+## How it works
+
+```
+ admin (browser / API)
+        |  login: Vault userpass, then a server-side portal session (+ CSRF)
+        v
+ +-----------------+   AppRole "vdba-service"    +-----------------------+
+ |  portal         | --------------------------> |  Vault (OSS)          |
+ |  (middleware,   |   narrow policy: roles for  |  database engine      |
+ |  SQLite store)  |   vdba_*, token create,     |  file audit device    |
+ +-----------------+   lease revoke, KV read     +-----------+-----------+
+        ^                                                    |  connects as
+        | reads catalog with a read-only                     |  non-superuser
+        | introspection account (from Vault KV)              v  "vault_manager"
+        |                                         +-----------------------+
+        +-----------------------------------------|  PostgreSQL 18        |
+                                                  |  ClickHouse 25.8 LTS  |
+ recipient: psql / clickhouse client  ----------> |  vdba_<grant>_<rand>  |
+            with the one-time password            +-----------------------+
+```
+
+- The portal talks to Vault only as its own AppRole identity. Admins hold a marker policy and no Vault rights.
+- Vault connects to each database as `vault_manager`, a non-superuser (details of its grants are in
+  `postgres-init/02-roles.sh` and `clickhouse-init/02-roles.sh`). Role creation SQL is generated by the portal from
+  fixed templates and validated identifiers.
+- For every grant the portal creates one orphan Vault token (display name = grant id) and reads
+  `database/creds/<grant>` once with it. That token owns the lease, so logging out as an admin does not revoke the
+  grant. The recipient never receives a Vault token; the token is thrown away after the read and its accessor is
+  kept to revoke it later.
+
+Grant lifecycle (every external step is written to SQLite first):
+
+```
+issuing --> active --> revoking --> revoked
+   |           |  (TTL ends)  ^
+   |           +--> expired   |   revoke or reconciler retry
+   +--> failed (cleaned up)   +-- stays here with last_error until the cleanup is confirmed
+```
+
+A reconciler runs at start and every 60 s. It retries `issuing` and `revoking` rows, finishes expired grants,
+finds leftovers by the `vdba_<grant>_` prefix and warns about untracked accounts. Revocation locks the PostgreSQL
+role (`NOLOGIN`), terminates its sessions and checks `pg_stat_activity` until none remain, revokes the lease
+synchronously (Vault runs the drop statements), confirms the account is gone and revokes the token. Expiry works
+without the portal: Vault revokes the lease by itself and PostgreSQL's `VALID UNTIL` blocks logins meanwhile.
 
 ## Security model
 
-- The running app **never holds Vault's root token or a shared admin
-  password**. Every admin logs into Vault's own `userpass` auth method with
-  their own account; the app uses *that person's* Vault token for every
-  subsequent call. Vault's ACL policies are the only enforcement point — an
-  account without the `db-access-admin` policy simply cannot do anything
-  here, in or outside this UI.
-- Root/privileged tokens are only ever used by `first_time_setup.py`, which
-  you run once per Vault deployment (it's idempotent, safe to re-run).
-- Generated database passwords are 12 chars via a Vault `password_policy`;
-  logins are alphanumeric-only via a Vault `username_template` — both native
-  Vault features, not custom code.
-- Token-mode grants get a Vault token scoped, via a dedicated
-  `grant-token-issuer` token role, to `read` on exactly one
-  `database/creds/<role>` path — nothing else, including no ability to
-  browse other grants.
-- Admin/root DB connection credentials can be rotated from the UI
-  (`/settings`) via Vault's native `database/rotate-root/<name>` — after
-  that, nobody (including this app) can read the password back; Vault
-  manages it internally from then on.
+Full threat model and residual risks: [SECURITY.md](SECURITY.md). Summary:
 
-## Getting started (new clone)
+- An admin cannot write Vault policies, roles or connections, and the portal's service identity cannot either.
+  The root token is revoked at the end of setup. The middleware container mounts only the AppRole files.
+- A recipient gets only the listed tables (and sequences owned by them), no DDL, for the TTL, and a revoked
+  account is locked out and its sessions terminated. Passwords are shown once, sent with `Cache-Control: no-store`,
+  and never stored or logged.
+- Sessions are server-side and re-validated against the current Vault user. State-changing requests need a CSRF
+  token and a matching `Origin`. Request bodies are limited to 64 KiB. Vault's file audit device is on.
 
-Requirements: Docker + Docker Compose. Nothing else needs installing on the
-host — Vault, Postgres, ClickHouse and the admin app all run in containers.
+Residual risks you must know about:
 
-```bash
-git clone https://github.com/DanilaZanin/vault-db-access.git
-cd vault-db-access
-cp .env.example .env        # fill in real values, or leave the DB passwords
-                             # blank and configure them later via /settings
-docker compose build
-docker compose up -d
-docker compose run --rm middleware python -m app.first_time_setup \
-  --init --persist-secrets \
-  --admin-user <your-name> --admin-password '<pick-a-password>'
+- ClickHouse `CREATE/ALTER/DROP USER` rights are global. A compromised portal could change other SQL-managed
+  ClickHouse users. Use a dedicated ClickHouse instance.
+- `bootstrap_admin` in the demo ClickHouse is a full administrator reachable on the published port.
+- Transport security between the components is the operator's job. The demo is plain HTTP on 127.0.0.1 and an
+  internal docker network and says so (`VDBA_ALLOW_INSECURE=1`).
+- The store is one SQLite file used by one process. There is no HA.
+- The ClickHouse plugin has dependency advisories without an upstream fix (docker/docker, pgproto3); Trivy lists
+  them. Debian base-image CVEs without a fix remain in the middleware image.
+- The Vault `revoke-accessor` permission is global, and there is no login rate limiting.
+
+## Production checklist
+
+- Put TLS in front of the portal (reverse proxy) and set `VDBA_PUBLIC_ORIGIN=https://...`; the portal refuses a
+  plain-http public origin on a non-loopback host unless `VDBA_ALLOW_INSECURE=1`.
+- Run Vault with a TLS listener (edit `VAULT_LOCAL_CONFIG` in `docker-compose.yml`) and change `VAULT_ADDR`.
+- PostgreSQL: set `VDBA_PG_SSLMODE=verify-full` and `VDBA_PG_SSLROOTCERT=<path to the CA inside the vault container>`
+  before setup, and remove `VDBA_ALLOW_INSECURE`. Setup refuses to run without either a TLS setting or the explicit
+  insecure flag. ClickHouse transport is not configured by this repo: use a secure port and TLS on your server.
+- Use a dedicated ClickHouse instance. Remove or lock down `bootstrap_admin` and do not publish its port.
+- Back up the `/data` volume. Consistent copy of the SQLite file, then fetch it (it holds hashed session ids and
+  admin login tokens, so protect it):
+  ```
+  docker compose exec -T middleware python -c "import sqlite3;s=sqlite3.connect('/data/vdba.sqlite3');d=sqlite3.connect('/tmp/backup.sqlite3');s.backup(d)"
+  docker compose cp middleware:/tmp/backup.sqlite3 ./backup.sqlite3
+  ```
+  Also back up the Vault data volume and `./secrets/vault-keys.json` (the unseal key) separately.
+- After a Vault restart it is sealed again: `make setup` unseals it from `./secrets/vault-keys.json` and changes
+  nothing else.
+- Re-running setup after the root token was revoked: setup then only unseals and checks the AppRole login. To change
+  policies or connections you need a privileged Vault token again. In my test on Vault 2.1.1,
+  `vault operator generate-root -init` answered `permission denied` without a token, so do not rely on it. Either
+  run setup with `SETUP_ARGS=--keep-root` (the root token then stays in `./secrets/vault-keys.json`, store it
+  offline), or keep a break-glass admin policy of your own in Vault. For the demo, `make down && make up` starts over
+  (this deletes all data).
+- Upgrading from the layout before v0.1: breaking changes are listed in [CHANGELOG.md](CHANGELOG.md): `grants.json`
+  became SQLite (old grants are not migrated, revoke them first), `vaultadmin.xml` is gone, token delivery and
+  `allow_create` are removed, setup is the new one-off service, connectors are non-superuser, `.env` changed, ports
+  are loopback-only, API clients need `Origin` and CSRF.
+- Published images (after the first `v*` tag is released) are built for amd64 and arm64, with SBOM and provenance,
+  and signed with cosign keyless:
+  ```
+  cosign verify ghcr.io/danilazanin/vault-db-access-middleware:v0.1.0 \
+    --certificate-identity-regexp 'https://github.com/DanilaZanin/vault-db-access/' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  make up-release VDBA_VERSION=v0.1.0   # = docker compose -f docker-compose.yml -f compose.release.yml ...
+  ```
+  I could not run the two commands above before a release exists.
+
+## What it does not do yet (ideas for v0.2)
+
+- OIDC / SSO with groups mapped to databases (today: Vault userpass accounts with the `db-access-admin` policy).
+- An approval workflow for grant requests.
+- Token delivery mode (recipient logs into Vault) and `allow_create` scratch schemas, both removed in v0.1 because
+  they need an ownership and cleanup contract.
+- A Helm chart and high availability.
+
+## Development
+
+```
+make lint     # ruff check + format check, hadolint if installed
+make audit    # pip-audit on the locked runtime dependencies
+make unit     # unit tests only
+make test     # unit tests, then integration tests if a stack is running (skipped with a banner otherwise)
+make check    # fresh stack with test hooks, unit + integration; fails if the stack is unreachable
+make images   # build vdba-app:local and vdba-vault:local
+make down     # destroy stack, volumes and ./secrets
 ```
 
-Then open `http://<host>:8000` and log in with the admin user/password you
-just created. That's the whole setup — everything else (issuing accounts,
-picking tables/commands, rotating the DB connection password) happens in
-that UI afterwards. See "Production deployment" below before using this for
-anything beyond local testing/evaluation — the quickstart above intentionally
-takes shortcuts (single unseal key stored on disk, plain HTTP) that are fine
-for trying it out but not for a real deployment.
+Layout: `middleware/app` (portal, setup, reconciler), `postgres-init` and `clickhouse-init` (sample data and the
+manager accounts), `vault/` (Vault image with the pinned ClickHouse plugin), `tests/unit`, `tests/integration`.
+Unit tests need no Docker. Integration tests (`tests/integration`) run against the real compose stack and include the
+security regression tests: each one proves that an original exploit fails. `make check` sets
+`VDBA_REQUIRE_STACK=1`, so an unreachable stack is a failure, never a skip, and starts the stack with
+`VDBA_TEST_HOOKS=1` (fault injection for crash tests and a 2-hour test-admin token in `secrets/test-admin-token`;
+never use that in production). CI (`.github/workflows/ci.yml`) runs everything plus pip-audit, hadolint, actionlint
+and Trivy.
 
-## Local dev/test quickstart
+| Finding | Regression test (tests/integration) |
+|---|---|
+| Admin escalates to Vault root via policies, roles, connections (SSRF) | `test_01_admin_token_cannot_touch_policies_roles_or_connections`, `test_02_service_identity_is_narrow` |
+| Root token / secrets mounted into the running app | `test_02b_middleware_has_no_root_secrets`, `test_02c_root_token_revoked_and_audit_device_on` |
+| Ports open on all interfaces | `test_02d_ports_are_loopback_only` |
+| Passwords in `grants.json` and `GET /api/grants` | `test_03_no_password_is_ever_exposed_or_stored` |
+| Revoke race, account survives revocation | `test_04_revoke_kills_the_account_within_five_seconds`, `test_04b_open_postgres_session_is_terminated_on_revoke`, `test_postgres_termination_is_confirmed_by_pg_stat_activity` |
+| Logout revokes the admin's grants | `test_05_logout_of_the_issuing_admin_does_not_revoke_grants` |
+| TTL not validated, `allow_create` truthy strings | `test_06_ttl_is_validated`, `test_06b_removed_and_unknown_fields_are_rejected`, `test_06c_expires_at_follows_the_vault_lease` |
+| No CSRF, vault token in cookie, 14-day session | `test_07_csrf`, `test_07b_session_and_cookie_hygiene`, `test_state_changing_request_without_origin_or_fetch_metadata_is_rejected` |
+| Multipart DoS / body limit | `test_body_limit_cannot_be_bypassed_with_chunked_encoding` |
+| Session survives removal of admin rights | `test_session_ends_when_admin_rights_are_removed` |
+| INSERT grants all sequences, DROP on whole database, grants beyond listed tables | `test_08_postgres_grant_is_limited_to_listed_tables_and_sequences`, `test_08b_postgres_all_commands_and_whole_database`, `test_08c_clickhouse_grant_is_limited_and_cannot_drop` |
+| Interrupted issue leaves resources | `test_09_interrupted_issue_is_cleaned_by_the_reconciler`, `test_lost_token_create_response_does_not_leave_a_live_token`, `test_partial_clickhouse_account_is_removed_when_a_later_grant_fails` |
+| Old operations dropped from the retry list | `test_old_revoking_row_is_retried_even_behind_a_thousand_newer_rows` |
+| Expiry depends on the web app | `test_10_expiry_works_without_the_web_app` |
+| Hard-coded ClickHouse admin, rotate fails, superuser connectors | `test_11_manager_password_comes_from_env_and_rotation_works`, `test_setup_refuses_a_superuser_or_wrong_account_connector` |
+| Default / placeholder secrets | `test_12_stack_refuses_to_start_with_changeme` |
+| SQLite WAL readable, session ids stored in clear | `test_sqlite_files_and_session_ids_are_private` |
+| One database down hides the other, backend errors leak | `test_one_database_down_does_not_hide_the_other_catalog`, `test_errors_never_leak_backend_text` |
 
-```bash
-docker compose build
-docker compose up -d
-docker compose run --rm middleware python -m app.first_time_setup \
-  --init --persist-secrets \
-  --admin-user ivanov --admin-password 'change-me'
-```
+Unit tests cover the SQL builders (identifier validation, sequences, maintenance statements), the request model,
+the preflight check, the SQLite store, templates, the reconciler's decisions and admission limits.
 
-`--init --persist-secrets` is dev-only: it initializes Vault with a single
-unseal key/share and stores the root token + key on disk (`./secrets/`) so
-the container can unseal itself. **Do not use this in production** — see below.
+## License
 
-Log into `http://<host>:8000` with the Vault username/password you just
-created. Vault's own UI is at `http://<host>:8200`.
-
-To add more admins later (as root, or as any existing `db-access-admin`):
-
-```bash
-vault write auth/userpass/users/petrov password='...' token_policies=db-access-admin
-```
-
-## Production deployment
-
-The stack is deployment-target-agnostic (plain Docker Compose today,
-Kubernetes later) — everything below is env-var driven, no code changes.
-
-**1. Vault init/unseal — do this the real way.** In production, initialize
-Vault with multiple key shares distributed to different trusted people
-(`VAULT_INIT_SHARES` / `VAULT_INIT_THRESHOLD` if using `--init`, or better,
-run `vault operator init`/`unseal` yourself outside this app entirely). Then
-run setup with a temporary token instead of `--init`:
-
-```bash
-VAULT_ROOT_TOKEN=hvs.xxx docker compose run --rm middleware python -m app.first_time_setup \
-  --admin-user ivanov --admin-password 'change-me'
-```
-
-Nothing is written to disk in this mode. For real HA/auto-unseal, add a
-`seal "awskms" {}` (or azure/gcp) stanza as an extra `.hcl` file under
-`vault/` — Vault merges every file in the config directory, so this needs no
-changes to `config.hcl`.
-
-**2. TLS.** The listener isn't in `config.hcl` — it's supplied via the
-`VAULT_LOCAL_CONFIG` env var in `docker-compose.yml` specifically so this is
-a config change, not a code change:
-
-```json
-{"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":false,
-  "tls_cert_file":"/vault/tls/cert.pem","tls_key_file":"/vault/tls/key.pem"}},
- "api_addr":"https://vault.example.com:8200"}
-```
-
-Mount your cert/key into `/vault/tls` and set `VAULT_ADDR` accordingly for
-the middleware.
-
-**3. `SESSION_SECRET_KEY`.** Set this explicitly (`openssl rand -hex 32`) —
-without it the app generates a random one at every restart and invalidates
-all sessions. Required if you ever run more than one middleware replica.
-
-**4. Postgres/ClickHouse root connection.** Either seed it once via
-`POSTGRES_SUPERUSER_PASSWORD` / `CLICKHOUSE_VAULTADMIN_PASSWORD` passed only
-to the `first_time_setup` run (never to the long-running service), or skip
-that entirely and enter it through `/settings` after first login. Rotate it
-from the same page whenever you like.
-
-**5. Container.** The middleware image already runs as non-root (uid 1000)
-and has a healthcheck. If bind-mounting `./secrets`, `chown -R 1000:1000` it
-first (or use a named volume instead, which Docker owns correctly automatically).
-
-## Errors hit while building this (and the fixes)
-
-Kept here so nobody re-discovers these the hard way if they extend this project.
-
-1. **Vault double-loaded its own config and refused to start** ("address
-   already in use" on 8200, inside a single container). The official
-   `hashicorp/vault` entrypoint always passes `-config=/vault/config` itself;
-   also passing `-config=/vault/config/config.hcl` on the `command:` line
-   loads the same listener stanza twice. Fix: just mount `config.hcl` into
-   `/vault/config/` and use `command: ["server"]`, nothing else.
-
-2. **Vault crashed with `permission denied` writing to its storage path.**
-   The entrypoint only `chown`s `/vault/config`, `/vault/logs`, `/vault/file`
-   to the non-root `vault` user — not arbitrary custom paths. Fix: use
-   `storage "file" { path = "/vault/file" }`, not `/vault/data`.
-
-3. **hvac (the Python Vault client) doesn't have a method for everything.**
-   `client.sys.register_plugin(...)` and `client.sys.create_or_update_password_policy(...)`
-   don't exist in hvac 2.3.0 — use the generic `client.write("sys/plugins/catalog/...")`
-   /`client.write("sys/policies/password/...")` instead of assuming a named
-   wrapper exists. Also: policy management must go through the modern
-   `sys/policies/acl/<name>` path (`client.write`/`client.delete`), not the
-   legacy `client.sys.create_or_update_policy`/`delete_policy` wrappers (they
-   hit `sys/policy/`, a different, deprecated endpoint) — a policy scoped
-   to `sys/policies/acl/*` will 403 against the legacy path in a very
-   confusing way ("permission denied" even though the policy "looks right").
-
-4. **The ClickHouse Vault plugin failed with `fork/exec: no such file or
-   directory` even though the file clearly existed.** It was built with cgo
-   enabled (default on a glibc/Debian builder), producing a dynamically
-   linked binary — but the official Vault image is Alpine/musl and has no
-   glibc loader. Fix: `CGO_ENABLED=0 GOOS=linux go build`.
-
-5. **`INSERT` grants failed with "permission denied for sequence"** on
-   Postgres tables with `SERIAL`/`IDENTITY` columns. Table-level `INSERT`
-   alone isn't enough; the role also needs
-   `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public`.
-
-6. **ClickHouse queries silently returned "unknown table" for the right
-   table name.** `clickhouse_connect.get_client()` doesn't default to any
-   particular database — pass `database=` explicitly or unqualified table
-   names resolve against `default`, not your actual DB.
-
-7. **A minimal-privilege "just list table names" account saw zero tables.**
-   Both `information_schema.tables` (Postgres) and `system.tables`
-   (ClickHouse) are privilege-filtered per user. Fix: Postgres →
-   `pg_catalog.pg_tables` instead (not filtered); ClickHouse →
-   `GRANT SHOW TABLES ON db.* TO user` (lighter than `SELECT`) before
-   `system.tables` shows anything.
-
-8. **Rotating the Postgres/ClickHouse root connection password broke table
-   listing.** Obvious in hindsight: after `database/rotate-root`, nobody —
-   including this app — can read that password back, by design. Any feature
-   that isn't the Vault role-issuing machinery itself needs its *own*,
-   separate, never-rotated credential. That's why there's a permanent
-   `vault_introspect` account distinct from the connection's root credential.
-
-9. **`sys/leases/revoke-prefix/*` returned `permission denied` despite the
-   policy granting `update` on it.** It's one of Vault's "sudo-protected"
-   paths — `update` alone isn't enough, the policy also needs `sudo` in the
-   same capabilities list.
-
-10. **Minting a scoped token for token-mode delivery failed with `child
-    policies must be subset of parent`.** A non-root Vault token can't create
-    a child token carrying a policy it doesn't itself hold. Fix: a dedicated
-    token role (`auth/token/roles/grant-token-issuer` with
-    `allowed_policies_glob=["read-grant-*"]`), and mint through
-    `auth/token/create/grant-token-issuer` instead of the bare
-    `auth/token/create`.
-
-11. **Switched the middleware container to a non-root user for hardening,
-    then it couldn't write to the bind-mounted `./secrets` folder.** Bind
-    mounts keep host ownership; `chown -R 1000:1000 ./secrets` (matching the
-    container's uid) fixes it, or use a named volume instead.
-
-12. **Upgrading to `hashicorp/vault:2.0.4`, the plugin-build stage failed
-    with `chmod: Operation not permitted`.** The 2.0.4 base image switched to
-    running as the non-root `vault` user by default (1.19.0 ran as root until
-    its entrypoint dropped privileges). Fix: `USER root` before placing/
-    chmod-ing the plugin binary in the Dockerfile, `USER vault` after.
-
-13. **Tried Vault 2.0's scheduled root-rotation (`rotation_period` on
-    `database/config/<name>`), got `rotation manager capabilities not
-    supported in Vault Community Edition`.** It's Enterprise-only, like
-    Custom Messages. Reverted; manual rotation via `database/rotate-root`
-    remains the only (fully OSS) rotation path.
-
-## Running tests
-
-```bash
-docker compose run --rm middleware python -m app.first_time_setup \
-  --init --persist-secrets --admin-user ivanov --admin-password 'IvanovPass123!'
-
-docker run --rm --network vault-db-access_vault-db-access \
-  -v "$(pwd)":/work -w /work \
-  -e VAULT_ADMIN_PASSWORD='IvanovPass123!' \
-  python:3.12-slim \
-  bash -c "pip install -q -r middleware/requirements.txt pytest requests && pytest tests/ -v"
-```
+Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
