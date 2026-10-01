@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "docker:pinDigests", "helpers:pinGitHubActionDigests"],
+  "packageRules": [
+    {"matchPackageNames": ["postgres"], "allowedVersions": "/^18\\./"},
+    {"matchPackageNames": ["clickhouse/clickhouse-server"], "allowedVersions": "/^25\\.8\\./"},
+    {"matchPackageNames": ["hashicorp/vault"], "allowedVersions": "/^2\\./"},
+    {"matchManagers": ["github-actions"], "groupName": "github actions"}
+  ],
+  "lockFileMaintenance": {"enabled": true}
+}

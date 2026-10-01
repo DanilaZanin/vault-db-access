@@ -1,0 +1,19 @@
+# Run the published, signed images instead of building locally:
+#   docker compose -f docker-compose.yml -f compose.release.yml up -d ...   (or: make up-release)
+# VDBA_VERSION selects the tag (default: latest). Verify a signature with:
+#   cosign verify ghcr.io/danilazanin/vault-db-access-middleware:v0.1.0 \
+#     --certificate-identity-regexp 'https://github.com/DanilaZanin/vault-db-access/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+x-middleware-image: &mw
+  image: ghcr.io/danilazanin/vault-db-access-middleware:${VDBA_VERSION:-latest}
+  build: !reset null
+  pull_policy: always
+
+services:
+  preflight: *mw
+  setup: *mw
+  middleware: *mw
+  vault:
+    image: ghcr.io/danilazanin/vault-db-access-vault:${VDBA_VERSION:-latest}
+    build: !reset null
+    pull_policy: always

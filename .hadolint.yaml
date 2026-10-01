@@ -1,0 +1,5 @@
+failure-threshold: warning
+ignored:
+  - DL3008  # apt packages are not version-pinned: the base image is pinned by digest and we run `apt-get upgrade`
+  - DL3018  # same for apk
+  - DL3022  # COPY --from=vaultimg refers to a named build context (compose additional_contexts), not a stage

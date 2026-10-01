@@ -29,6 +29,9 @@ SECRETS = Path(os.environ.get("VDBA_SECRETS_DIR", "/secrets"))
 KEYS_FILE = SECRETS / "vault-keys.json"
 APPROLE_OUT = SECRETS / "approle"
 APP_UID = int(os.environ.get("VDBA_APP_UID", "1000"))
+# On Linux hosts the bind-mounted files would be root-owned (setup runs as root); hand the key material to the
+# host user who ran `make` so tests and operators can read it without sudo.
+HOST_UID = int(os.environ["VDBA_HOST_UID"]) if os.environ.get("VDBA_HOST_UID") else None
 PLUGIN_NAME = "clickhouse-database-plugin"
 PLUGIN_SHA_FILE = Path("/opt/vdba/clickhouse-plugin.sha256")
 
@@ -107,7 +110,7 @@ def init_and_unseal() -> dict:
         threshold = int(os.environ.get("VDBA_UNSEAL_THRESHOLD", "1"))
         res = c.sys.initialize(secret_shares=shares, secret_threshold=threshold)
         keys = {"keys": res["keys_base64"], "root_token": res["root_token"], "threshold": threshold}
-        write_private(KEYS_FILE, json.dumps(keys))  # BEFORE anything else can fail
+        write_private(KEYS_FILE, json.dumps(keys), uid=HOST_UID)  # BEFORE anything else can fail
         log(f"Vault initialized; unseal key(s) and root token written to {KEYS_FILE} (mode 0600)")
     if c.sys.is_sealed():
         if not keys.get("keys"):
@@ -350,7 +353,7 @@ def mint_test_admin(c: hvac.Client) -> None:
         "vdba-test-admin", 'path "*" { capabilities = ["create","read","update","delete","list","sudo"] }'
     )
     tok = c.auth.token.create(policies=["vdba-test-admin"], ttl="2h", no_parent=True, renewable=False)
-    write_private(SECRETS / "test-admin-token", tok["auth"]["client_token"])
+    write_private(SECRETS / "test-admin-token", tok["auth"]["client_token"], uid=HOST_UID)
     log("TEST HOOKS ON: wrote a 2 h test-admin token to secrets/test-admin-token (never do this in production)")
 
 
@@ -361,7 +364,7 @@ def revoke_root(c: hvac.Client, keep: bool) -> None:
     c.auth.token.revoke_self()
     keys = load_keys()
     keys.pop("root_token", None)
-    write_private(KEYS_FILE, json.dumps(keys))
+    write_private(KEYS_FILE, json.dumps(keys), uid=HOST_UID)
     (SECRETS / "root-token").unlink(missing_ok=True)
     log("root token revoked and removed from disk")
 

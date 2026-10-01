@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # weekly: new CVEs and base-image updates
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv sync --frozen
+      - name: ruff
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: unit tests
+        run: uv run pytest tests/unit -q
+      - name: pip-audit (locked runtime dependencies)
+        run: |
+          uv export --frozen --no-dev --no-emit-project --no-hashes > /tmp/requirements.txt
+          uv run pip-audit -r /tmp/requirements.txt --no-deps --disable-pip
+      - name: hadolint
+        run: |
+          for f in middleware/Dockerfile vault/Dockerfile; do
+            docker run --rm -i -v "$PWD/.hadolint.yaml:/.hadolint.yaml:ro" \
+              hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d \
+              hadolint --config /.hadolint.yaml - < "$f"
+          done
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+      - name: trivy fs (dependencies, secrets, misconfiguration)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv sync --frozen
+      - name: make check (fresh stack, unit + integration, fails if the stack is unreachable)
+        run: make check
+      - name: logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200 || true
+      - name: tear down
+        if: always()
+        run: make down || true
+
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: build both images
+        run: make images
+      - name: trivy image vault (HIGH/CRITICAL with a fix fail the build)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: vdba-vault:local
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: trivy image middleware (HIGH/CRITICAL with a fix fail the build)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: vdba-app:local
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

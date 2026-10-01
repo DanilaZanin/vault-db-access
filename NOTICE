@@ -1,0 +1,10 @@
+vault-db-access
+Copyright 2026 Danila Zanin
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It builds on, and its container images bundle or depend on, third-party software under their own licenses:
+- HashiCorp Vault (https://github.com/hashicorp/vault), used as the base of the vault image.
+- vault-plugin-database-clickhouse by ContentSquare (https://github.com/ContentSquare/vault-plugin-database-clickhouse),
+  MPL-2.0, built from source at a pinned commit and shipped inside the vault image.
+- PostgreSQL and ClickHouse server images, and the Python packages listed in uv.lock, each under their own licenses.
