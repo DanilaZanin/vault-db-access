@@ -110,10 +110,19 @@ def insert_grant(g: dict[str, Any]) -> None:
             "INSERT INTO grants (id, db_type, scope, tables, commands, requested_for, issued_by,"
             " ttl_seconds, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
-                g["id"], g["db_type"], g["scope"], json.dumps(g["tables"]), json.dumps(g["commands"]),
-                g["requested_for"], g["issued_by"], g["ttl_seconds"], "issuing", now, now,
+                g["id"],
+                g["db_type"],
+                g["scope"],
+                json.dumps(g["tables"]),
+                json.dumps(g["commands"]),
+                g["requested_for"],
+                g["issued_by"],
+                g["ttl_seconds"],
+                "issuing",
+                now,
+                now,
             ),
-        )  # fmt: skip
+        )
 
 
 def update_grant(grant_id: str, **fields: Any) -> None:
@@ -157,7 +166,10 @@ def audit(request_id: str | None, grant_id: str | None, actor: str, action: str,
 def audit_exists(action: str, detail: str) -> bool:
     with _lock:
         assert _conn is not None
-        return _conn.execute("SELECT 1 FROM audit WHERE action = ? AND detail = ?", (action, detail)).fetchone() is not None
+        return (
+            _conn.execute("SELECT 1 FROM audit WHERE action = ? AND detail = ?", (action, detail)).fetchone()
+            is not None
+        )
 
 
 # ---- sessions -----------------------------------------------------------------------------

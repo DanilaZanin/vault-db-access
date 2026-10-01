@@ -116,7 +116,10 @@ def init_and_unseal() -> dict:
 
 
 def root_client(keys: dict) -> hvac.Client | None:
-    for source in (keys.get("root_token"), (SECRETS / "root-token").read_text().strip() if (SECRETS / "root-token").exists() else None):
+    for source in (
+        keys.get("root_token"),
+        (SECRETS / "root-token").read_text().strip() if (SECRETS / "root-token").exists() else None,
+    ):
         if source:
             c = client(source)
             try:
@@ -169,20 +172,28 @@ def ensure_connection(c: hvac.Client, name: str, plugin: str, url: str, user: st
 
 def ensure_connections(c: hvac.Client, env: dict[str, str]) -> None:
     ensure_connection(
-        c, "postgres", "postgresql-database-plugin",
+        c,
+        "postgres",
+        "postgresql-database-plugin",
         f"postgresql://{{{{username}}}}:{{{{password}}}}@{config.POSTGRES_HOST}:{config.POSTGRES_PORT}/"
         f"{config.POSTGRES_DB}?sslmode=disable",
-        "vault_manager", env["PG_MANAGER_PASSWORD"],
-    )  # fmt: skip
+        "vault_manager",
+        env["PG_MANAGER_PASSWORD"],
+    )
     ensure_connection(
-        c, "clickhouse", PLUGIN_NAME,
+        c,
+        "clickhouse",
+        PLUGIN_NAME,
         f"clickhouse://{config.CLICKHOUSE_HOST}:{config.CLICKHOUSE_NATIVE_PORT}"
         "?username={{username}}&password={{password}}&dial_timeout=10s",
-        "vault_manager", env["CLICKHOUSE_MANAGER_PASSWORD"],
-    )  # fmt: skip
+        "vault_manager",
+        env["CLICKHOUSE_MANAGER_PASSWORD"],
+    )
     for db, var in (("postgres", "PG_INTROSPECT_PASSWORD"), ("clickhouse", "CLICKHOUSE_INTROSPECT_PASSWORD")):
         c.secrets.kv.v2.create_or_update_secret(
-            path=f"vdba/introspect/{db}", secret={"username": "vault_introspect", "password": env[var]}, mount_point="kv"
+            path=f"vdba/introspect/{db}",
+            secret={"username": "vault_introspect", "password": env[var]},
+            mount_point="kv",
         )
 
 
@@ -197,7 +208,7 @@ def ensure_policies_and_roles(c: hvac.Client, env: dict[str, str]) -> None:
         renewable=False,
         token_no_default_policy=True,
         token_type="service",
-    )  # fmt: skip
+    )
     auth = c.sys.list_auth_methods()["data"]
     if "userpass/" not in auth:
         c.sys.enable_auth_method("userpass", path="userpass")
@@ -209,7 +220,7 @@ def ensure_policies_and_roles(c: hvac.Client, env: dict[str, str]) -> None:
         token_policies=[config.ADMIN_POLICY_NAME],
         token_ttl="8h",
         token_max_ttl="8h",
-    )  # fmt: skip
+    )
     c.write(
         f"auth/approle/role/{config.APPROLE_NAME}",
         token_policies=[config.SERVICE_POLICY_NAME],
@@ -219,7 +230,7 @@ def ensure_policies_and_roles(c: hvac.Client, env: dict[str, str]) -> None:
         token_type="service",
         secret_id_num_uses=0,
         secret_id_ttl=0,
-    )  # fmt: skip
+    )
 
 
 def approle_login_ok(role_id: str, secret_id: str) -> bool:
@@ -290,7 +301,11 @@ def main() -> None:
     root = root_client(keys)
     if root is None:
         role_id_f, sid_f = APPROLE_OUT / "role_id", APPROLE_OUT / "secret_id"
-        if role_id_f.exists() and sid_f.exists() and approle_login_ok(role_id_f.read_text().strip(), sid_f.read_text().strip()):
+        if (
+            role_id_f.exists()
+            and sid_f.exists()
+            and approle_login_ok(role_id_f.read_text().strip(), sid_f.read_text().strip())
+        ):
             log("already provisioned (root token is revoked and the AppRole login works); nothing to do")
             return
         raise SystemExit(

@@ -84,9 +84,18 @@ class Guard:
     @staticmethod
     async def _reject(send, rid, status, text):
         body = f'{{"detail":"{text}"}}'.encode()
-        await send({"type": "http.response.start", "status": status, "headers": [
-            (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
-            (b"x-request-id", rid.encode()), (b"cache-control", b"no-store")]})  # fmt: skip
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"x-request-id", rid.encode()),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
 
 
@@ -137,7 +146,9 @@ def _secure_cookie(request: Request) -> bool:
 
 
 def _set_cookie(request: Request, response: Response, name: str, value: str, max_age: int) -> None:
-    response.set_cookie(name, value, max_age=max_age, httponly=True, samesite="lax", secure=_secure_cookie(request), path="/")
+    response.set_cookie(
+        name, value, max_age=max_age, httponly=True, samesite="lax", secure=_secure_cookie(request), path="/"
+    )
 
 
 def check_origin(request: Request) -> None:
@@ -276,15 +287,23 @@ def _index(request: Request, s: dict, result=None, error=None, status: int = 200
         pg, ch = [], []
         error = error or "Could not list tables (database unreachable?)"
     return _page(
-        request, "index.html",
+        request,
+        "index.html",
         {
-            "username": s["username"], "csrf": s["csrf"], "pg_tables": pg, "ch_tables": ch,
-            "pg_commands": config.ALLOWED_POSTGRES_COMMANDS, "ch_commands": config.ALLOWED_CLICKHOUSE_COMMANDS,
+            "username": s["username"],
+            "csrf": s["csrf"],
+            "pg_tables": pg,
+            "ch_tables": ch,
+            "pg_commands": config.ALLOWED_POSTGRES_COMMANDS,
+            "ch_commands": config.ALLOWED_CLICKHOUSE_COMMANDS,
             "grants": [grants.public(g) for g in store.list_grants(limit=100)],
-            "result": result, "error": error, "ttl_min": config.TTL_MIN, "ttl_max": config.TTL_MAX,
+            "result": result,
+            "error": error,
+            "ttl_min": config.TTL_MIN,
+            "ttl_max": config.TTL_MAX,
         },
         status,
-    )  # fmt: skip
+    )
 
 
 @api.get("/", response_class=HTMLResponse)
@@ -310,11 +329,16 @@ async def create_grant_form(request: Request, s: dict = Depends(require_admin)):
     form = await request.form()
     try:
         ttl = int(str(form.get("ttl_seconds", "")).strip())
-        req = GrantRequest.model_validate({
-            "db_type": form.get("db_type"), "scope": form.get("scope"),
-            "tables": form.getlist("tables"), "commands": form.getlist("commands"),
-            "ttl_seconds": ttl, "requested_for": form.get("requested_for", ""),
-        })  # fmt: skip
+        req = GrantRequest.model_validate(
+            {
+                "db_type": form.get("db_type"),
+                "scope": form.get("scope"),
+                "tables": form.getlist("tables"),
+                "commands": form.getlist("commands"),
+                "ttl_seconds": ttl,
+                "requested_for": form.get("requested_for", ""),
+            }
+        )
         result = await run_in_threadpool(_issue, request, s, req)
     except (ValueError, ValidationError) as exc:
         msg = str(exc) if isinstance(exc, ValueError) and not isinstance(exc, ValidationError) else "invalid form input"
@@ -336,7 +360,9 @@ async def revoke_grant(request: Request, grant_id: str = GRANT_ID, s: dict = Dep
     except vault_client.VaultUnavailable:
         raise
     except Exception as exc:
-        raise HTTPException(502, f"revocation incomplete, will be retried (request {request.state.request_id})") from exc
+        raise HTTPException(
+            502, f"revocation incomplete, will be retried (request {request.state.request_id})"
+        ) from exc
     if _wants_json(request) or request.headers.get("accept", "").startswith("application/json"):
         return g
     return RedirectResponse("/", status_code=303)

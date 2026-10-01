@@ -13,7 +13,10 @@ from .statement_builder import build_statements
 
 log = logging.getLogger("vdba.grants")
 
-_db_locks = {DbType.postgres: threading.Lock(), DbType.clickhouse: threading.Lock()}  # issue/revoke serialized per DB
+_db_locks = {
+    DbType.postgres: threading.Lock(),
+    DbType.clickhouse: threading.Lock(),
+}  # issue/revoke serialized per DB
 _ops = threading.BoundedSemaphore(config.MAX_CONCURRENT_OPS)
 _inflight: set[str] = set()
 _inflight_lock = threading.Lock()
@@ -58,11 +61,19 @@ def iso(ts: float | None) -> str | None:
 def public(g: dict[str, Any]) -> dict[str, Any]:
     """What the API/UI may show about a grant: no credentials exist in the store, and no Vault ids."""
     return {
-        "grant_id": g["id"], "db_type": g["db_type"], "scope": g["scope"], "tables": g["tables"],
-        "commands": g["commands"], "requested_for": g["requested_for"], "issued_by": g["issued_by"],
-        "ttl_seconds": g["ttl_seconds"], "status": g["status"], "username": g["username"],
-        "created_at": iso(g["created_at"]), "expires_at": iso(g["expires_at"]),
-    }  # fmt: skip
+        "grant_id": g["id"],
+        "db_type": g["db_type"],
+        "scope": g["scope"],
+        "tables": g["tables"],
+        "commands": g["commands"],
+        "requested_for": g["requested_for"],
+        "issued_by": g["issued_by"],
+        "ttl_seconds": g["ttl_seconds"],
+        "status": g["status"],
+        "username": g["username"],
+        "created_at": iso(g["created_at"]),
+        "expires_at": iso(g["expires_at"]),
+    }
 
 
 def issue(req: GrantRequest, actor: str, request_id: str) -> dict[str, Any]:
@@ -75,11 +86,18 @@ def issue(req: GrantRequest, actor: str, request_id: str) -> dict[str, Any]:
     grant_id = store.new_grant_id()
     lock = _begin(req.db_type, grant_id)
     try:
-        store.insert_grant({
-            "id": grant_id, "db_type": req.db_type.value, "scope": req.scope.value,
-            "tables": req.tables if req.scope.value == "tables" else [], "commands": req.commands,
-            "requested_for": req.requested_for, "issued_by": actor, "ttl_seconds": req.ttl_seconds,
-        })  # fmt: skip
+        store.insert_grant(
+            {
+                "id": grant_id,
+                "db_type": req.db_type.value,
+                "scope": req.scope.value,
+                "tables": req.tables if req.scope.value == "tables" else [],
+                "commands": req.commands,
+                "requested_for": req.requested_for,
+                "issued_by": actor,
+                "ttl_seconds": req.ttl_seconds,
+            }
+        )
         try:
             vault_client.write_role(grant_id, req.db_type, creation, revocation, req.ttl_seconds)
             faults.point("after_role_create")
@@ -176,13 +194,18 @@ def reconcile_once() -> None:
                 _teardown(g["id"], final, None)
         finally:
             _end(lock, g["id"])
+    for sess in store.purge_sessions():
+        vault_client.revoke_token_quietly(sess["vault_token"])
     _report_orphans()
 
 
 def _report_orphans() -> None:
     """DB accounts with our prefix that no live grant explains (e.g. a partial CREATE USER)."""
-    live = {g["username"] for g in store.list_grants(limit=1000) if g["username"]
-            and g["status"] in (Status.active.value, Status.revoking.value, Status.issuing.value)}  # fmt: skip
+    live = {
+        g["username"]
+        for g in store.list_grants(limit=1000)
+        if g["username"] and g["status"] in (Status.active.value, Status.revoking.value, Status.issuing.value)
+    }
     pending = any(g["status"] == Status.issuing.value for g in store.list_grants((Status.issuing.value,)))
     if pending:
         return

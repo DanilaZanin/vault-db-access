@@ -1,0 +1,6 @@
+*
+!pyproject.toml
+!uv.lock
+!middleware/Dockerfile
+!middleware/app
+**/__pycache__

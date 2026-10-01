@@ -1,67 +1,89 @@
-import os
-import sys
-
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "middleware"))
-
-from app.models import DbType, Scope  # noqa: E402
-from app.statement_builder import build_statements  # noqa: E402
+from app.models import DbType, Scope
+from app.statement_builder import build_statements, valid_identifier
 
 KNOWN = {"customers", "orders", "products"}
+SEQS = {"customers": ["customers_id_seq"], "orders": ["orders_id_seq"], "products": ["products_id_seq"]}
+
+
+def pg(scope, tables, commands, known=KNOWN, seqs=SEQS):
+    return build_statements(DbType.postgres, scope, tables, commands, known, seqs)
+
+
+def ch(scope, tables, commands, known=KNOWN):
+    return build_statements(DbType.clickhouse, scope, tables, commands, known)
 
 
 def test_postgres_table_scoped_select_only():
-    creation, revocation = build_statements(DbType.postgres, Scope.tables, ["customers"], ["SELECT"], False, KNOWN)
+    creation, revocation = pg(Scope.tables, ["customers"], ["SELECT"])
+    assert 'GRANT SELECT ON TABLE "public"."customers" TO "{{name}}";' in creation
     joined = " ".join(creation)
-    assert 'GRANT SELECT ON "customers" TO "{{name}}";' in creation
-    assert "orders" not in joined
-    assert "products" not in joined
+    assert "orders" not in joined and "products" not in joined
+    assert not any("SEQUENCE" in s for s in creation)  # SELECT does not need sequences
     assert 'DROP ROLE IF EXISTS "{{name}}";' in revocation
 
 
-def test_postgres_whole_db_multi_command():
-    creation, _ = build_statements(DbType.postgres, Scope.database, [], ["SELECT", "INSERT"], False, KNOWN)
-    assert 'GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO "{{name}}";' in creation
+def test_postgres_revocation_locks_out_before_dropping():
+    _, revocation = pg(Scope.tables, ["customers"], ["SELECT"])
+    assert revocation[0] == 'ALTER ROLE "{{name}}" NOLOGIN;'
+    assert "pg_terminate_backend" in revocation[1]
+    assert revocation.index('DROP OWNED BY "{{name}}";') < revocation.index('DROP ROLE IF EXISTS "{{name}}";')
 
 
-def test_postgres_allow_create_grants_schema_create():
-    creation, _ = build_statements(DbType.postgres, Scope.database, [], ["SELECT"], True, KNOWN)
-    assert 'GRANT CREATE ON SCHEMA public TO "{{name}}";' in creation
+def test_postgres_insert_grants_only_owned_sequences():
+    creation, _ = pg(Scope.tables, ["customers"], ["SELECT", "INSERT"])
+    seq = [s for s in creation if "SEQUENCE" in s]
+    assert seq == ['GRANT USAGE ON SEQUENCE "public"."customers_id_seq" TO "{{name}}";']
+    assert not any("ALL SEQUENCES" in s for s in creation)
 
 
-def test_postgres_no_create_grant_when_not_allowed():
-    creation, _ = build_statements(DbType.postgres, Scope.tables, ["customers"], ["SELECT"], False, KNOWN)
-    assert not any("CREATE ON SCHEMA" in s for s in creation)
+def test_postgres_database_scope_expands_to_existing_tables_only():
+    creation, _ = pg(Scope.database, [], ["SELECT"])
+    assert not any("ALL TABLES" in s for s in creation)
+    for t in KNOWN:
+        assert f'GRANT SELECT ON TABLE "public"."{t}" TO "{{{{name}}}}";' in creation
 
 
-def test_postgres_rejects_unknown_table():
+def test_no_create_or_drop_privileges_are_ever_generated():
+    for scope in Scope:
+        for builder in (pg, ch):
+            creation, _ = builder(scope, ["customers"], ["SELECT", "INSERT"])
+            text = " ".join(creation).upper()
+            assert "CREATE ON" not in text and "DROP TABLE" not in text and "CREATE TABLE" not in text
+
+
+def test_postgres_role_expires_with_the_lease():
+    creation, _ = pg(Scope.tables, ["customers"], ["SELECT"])
+    assert "VALID UNTIL '{{expiration}}'" in creation[0]
+
+
+@pytest.mark.parametrize("builder", [pg, ch])
+def test_rejects_unknown_table_command_and_empty(builder):
     with pytest.raises(ValueError):
-        build_statements(DbType.postgres, Scope.tables, ["not_a_table"], ["SELECT"], False, KNOWN)
-
-
-def test_postgres_rejects_bad_command():
+        builder(Scope.tables, ["not_a_table"], ["SELECT"])
     with pytest.raises(ValueError):
-        build_statements(DbType.postgres, Scope.tables, ["customers"], ["DROP TABLE"], False, KNOWN)
-
-
-def test_postgres_rejects_empty_commands():
+        builder(Scope.tables, ["customers"], ["DROP TABLE"])
     with pytest.raises(ValueError):
-        build_statements(DbType.postgres, Scope.tables, ["customers"], [], False, KNOWN)
+        builder(Scope.tables, ["customers"], [])
+    with pytest.raises(ValueError):
+        builder(Scope.tables, [], ["SELECT"])
+
+
+@pytest.mark.parametrize("bad", ["customers\n", "customers ", 'a"b', "a`b", "x;DROP", "", "1abc", "a" * 64])
+def test_identifier_validation_is_a_fullmatch(bad):
+    with pytest.raises(ValueError):
+        valid_identifier(bad)
+    with pytest.raises(ValueError):
+        ch(Scope.tables, [bad], ["SELECT"], known={bad, "customers"})
 
 
 def test_clickhouse_table_scoped():
-    creation, revocation = build_statements(DbType.clickhouse, Scope.tables, ["orders"], ["SELECT"], False, KNOWN)
-    assert "GRANT SELECT ON appdb.orders TO '{{name}}';" in creation
-    assert "DROP USER IF EXISTS '{{name}}';" in revocation
+    creation, revocation = ch(Scope.tables, ["orders"], ["SELECT"])
+    assert "GRANT SELECT ON `appdb`.`orders` TO '{{name}}';" in creation
+    assert not any("customers" in s for s in creation)
+    assert revocation == ["DROP USER IF EXISTS '{{name}}';"]
 
 
-def test_clickhouse_allow_create_grants_drop_too():
-    creation, _ = build_statements(DbType.clickhouse, Scope.database, [], ["SELECT"], True, KNOWN)
-    assert any("CREATE TABLE" in s for s in creation)
-    assert any("DROP TABLE" in s for s in creation)
-
-
-def test_clickhouse_rejects_unknown_table():
-    with pytest.raises(ValueError):
-        build_statements(DbType.clickhouse, Scope.tables, ["bogus"], ["SELECT"], False, KNOWN)
+def test_clickhouse_user_expires_with_the_lease():
+    creation, _ = ch(Scope.tables, ["orders"], ["SELECT"])
+    assert "VALID UNTIL '{{expiration}}'" in creation[0]

@@ -55,8 +55,7 @@ def build_postgres_statements(
     cmds = _commands(commands, config.ALLOWED_POSTGRES_COMMANDS)
     chosen = _tables(scope, tables, known_tables)
     statements = [
-        "CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' "
-        "CONNECTION LIMIT 5;",
+        "CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' CONNECTION LIMIT 5;",
         f'GRANT CONNECT ON DATABASE "{config.POSTGRES_DB}" TO "{{{{name}}}}";',
         'GRANT USAGE ON SCHEMA "public" TO "{{name}}";',
     ]
@@ -83,8 +82,7 @@ def build_clickhouse_statements(
     cmds = _commands(commands, config.ALLOWED_CLICKHOUSE_COMMANDS)
     chosen = _tables(scope, tables, known_tables)
     statements = [
-        "CREATE USER '{{name}}' IDENTIFIED WITH sha256_password BY '{{password}}' "
-        "VALID UNTIL '{{expiration}}';"
+        "CREATE USER '{{name}}' IDENTIFIED WITH sha256_password BY '{{password}}' VALID UNTIL '{{expiration}}';"
     ]
     for t in chosen:
         statements.append(f"GRANT {cmds} ON `{config.CLICKHOUSE_DB}`.`{t}` TO '{{{{name}}}}';")

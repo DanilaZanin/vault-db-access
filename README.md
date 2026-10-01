@@ -1,3 +1,8 @@
+> **v0.1 hardening in progress (branch `hardening-v0.1`).** The stack, setup flow and security model changed
+> completely (AppRole service identity, non-superuser DB connectors, SQLite store, `make up` / `make test`).
+> The README below still describes the previous layout and will be rewritten in phase 3. Until then see
+> `.ai/notes.md` for the current commands, grants and known limits.
+
 # Vault DB Access
 
 Self-service temporary database credentials on top of HashiCorp Vault 2.0's

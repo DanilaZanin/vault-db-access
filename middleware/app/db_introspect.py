@@ -25,18 +25,27 @@ def _ok(names: list[str]) -> list[str]:
 def _pg_connect() -> psycopg.Connection:
     user, password = vault_client.introspect_credentials(DbType.postgres)
     return psycopg.connect(
-        host=config.POSTGRES_HOST, port=config.POSTGRES_PORT, user=user, password=password,
-        dbname=config.POSTGRES_DB, connect_timeout=config.DB_TIMEOUT, autocommit=True,
+        host=config.POSTGRES_HOST,
+        port=config.POSTGRES_PORT,
+        user=user,
+        password=password,
+        dbname=config.POSTGRES_DB,
+        connect_timeout=config.DB_TIMEOUT,
+        autocommit=True,
         options=f"-c statement_timeout={config.DB_TIMEOUT * 1000}",
-    )  # fmt: skip
+    )
 
 
 def _ch_client():
     user, password = vault_client.introspect_credentials(DbType.clickhouse)
     return clickhouse_connect.get_client(
-        host=config.CLICKHOUSE_HOST, port=config.CLICKHOUSE_HTTP_PORT, username=user, password=password,
-        connect_timeout=config.DB_TIMEOUT, send_receive_timeout=config.DB_TIMEOUT,
-    )  # fmt: skip
+        host=config.CLICKHOUSE_HOST,
+        port=config.CLICKHOUSE_HTTP_PORT,
+        username=user,
+        password=password,
+        connect_timeout=config.DB_TIMEOUT,
+        send_receive_timeout=config.DB_TIMEOUT,
+    )
 
 
 _SEQ_SQL = """
@@ -51,9 +60,14 @@ WHERE s.relkind = 'S' AND t.relkind IN ('r', 'p') AND t.relnamespace = 'public':
 
 def postgres_catalog() -> Catalog:
     with _pg_connect() as conn:
-        tables = _ok([r[0] for r in conn.execute(
-            "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename"
-        ).fetchall()])  # fmt: skip
+        tables = _ok(
+            [
+                r[0]
+                for r in conn.execute(
+                    "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+                ).fetchall()
+            ]
+        )
         seqs: dict[str, list[str]] = {}
         for table, seq in conn.execute(_SEQ_SQL).fetchall():
             if table in tables and IDENTIFIER_RE.fullmatch(seq):
@@ -79,7 +93,5 @@ def leftover_users(db_type: DbType) -> list[str]:
     if db_type == DbType.postgres:
         with _pg_connect() as conn:
             return [r[0] for r in conn.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE %s", (pattern,))]
-    res = _ch_client().query(
-        "SELECT name FROM system.users WHERE name LIKE %(p)s", parameters={"p": pattern}
-    )
+    res = _ch_client().query("SELECT name FROM system.users WHERE name LIKE %(p)s", parameters={"p": pattern})
     return [r[0] for r in res.result_rows]
