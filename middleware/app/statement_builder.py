@@ -68,6 +68,8 @@ def build_postgres_statements(
                 valid_identifier(seq)
                 statements.append(f'GRANT USAGE ON SEQUENCE "public"."{seq}" TO "{{{{name}}}}";')
     revocation = [
+        "SET LOCAL lock_timeout = '5s';",
+        "SET LOCAL statement_timeout = '20s';",
         'ALTER ROLE "{{name}}" NOLOGIN;',
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{{name}}';",
         'DROP OWNED BY "{{name}}";',
@@ -103,3 +105,39 @@ def build_statements(
     if db_type == DbType.postgres:
         return build_postgres_statements(scope, tables, commands, known_tables, sequences or {})
     return build_clickhouse_statements(scope, tables, commands, known_tables)
+
+
+# ---- fixed maintenance statements, run as the DB manager through Vault (vault_client.run_as_manager) ----
+ACCOUNT_RE = re.compile(r"vdba_[0-9a-f]{10}_[a-z0-9]{6}")
+
+
+def valid_account(name: str) -> str:
+    if not ACCOUNT_RE.fullmatch(name):
+        raise ValueError(f"invalid account name: {name!r}")
+    return name
+
+
+def lockout_statements(db_type: DbType, account: str) -> list[str]:
+    """Committed lockout: no new logins. (ClickHouse needs no separate step: DROP USER is immediate.)"""
+    valid_account(account)
+    if db_type == DbType.postgres:
+        return ["SET LOCAL lock_timeout = '3s';", f'ALTER ROLE "{account}" NOLOGIN;']
+    return []
+
+
+def terminate_statements(db_type: DbType, account: str) -> list[str]:
+    valid_account(account)
+    if db_type == DbType.postgres:
+        return [f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{account}';"]  # noqa: S608 - validated
+    return []
+
+
+def drop_statements(db_type: DbType, account: str) -> list[str]:
+    valid_account(account)
+    if db_type == DbType.postgres:
+        return [
+            "SET LOCAL lock_timeout = '5s';",
+            f'DROP OWNED BY "{account}";',
+            f'DROP ROLE IF EXISTS "{account}";',
+        ]
+    return [f"DROP USER IF EXISTS '{account}';"]

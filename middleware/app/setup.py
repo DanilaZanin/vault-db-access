@@ -59,6 +59,12 @@ path "sys/leases/revoke/database/creds/vdba_*" { capabilities = ["update"] }
 # (listing leases requires sudo in Vault; scoped to our own role prefix only)
 path "sys/leases/lookup/database/creds/vdba_*" { capabilities = ["list", "sudo"] }
 path "auth/token/lookup-self" { capabilities = ["read"] }
+# Session re-validation reads the CURRENT policies of an admin user (never the password hash).
+path "auth/userpass/users/*" { capabilities = ["read"] }
+# Recovery of a grant token whose create response was lost: find it by its display name (grant id).
+# Accessors are not credentials; listing them needs sudo on this one path.
+path "auth/token/accessors" { capabilities = ["list", "sudo"] }
+path "auth/token/lookup-accessor" { capabilities = ["update"] }
 # Deliberately absent: sys/policies/*, database/config/*, database/creds/*, sys/leases/revoke-prefix.
 """
 CREDS_READER_POLICY = 'path "database/creds/vdba_*" { capabilities = ["read"] }\n'
@@ -152,9 +158,70 @@ def ensure_engines(c: hvac.Client) -> None:
     c.write(f"sys/plugins/catalog/database/{PLUGIN_NAME}", sha256=digest, command=PLUGIN_NAME)
 
 
+PROBES = {
+    # Run AS the connection's own DB account (through a throw-away role); a statement error = unsafe.
+    "postgres": [
+        "SELECT 1 / (CASE WHEN (SELECT rolsuper OR rolbypassrls OR rolreplication OR NOT rolcreaterole "
+        "FROM pg_roles WHERE rolname = current_user) THEN 0 ELSE 1 END)"
+    ],
+    "clickhouse": [
+        "SELECT throwIf((SELECT count() FROM system.grants WHERE user_name = currentUser() AND "
+        "access_type IN ('ALL', 'ACCESS MANAGEMENT', 'ROLE ADMIN', 'ALTER ROLE', 'CREATE ROLE')) > 0)"
+    ],
+}
+
+
+def validate_connection(c: hvac.Client, name: str) -> None:
+    """Refuse a connection that is not our least-privilege manager: wrong account name, or an account that
+    actually has superuser-like rights (checked by running a probe as that account). Raises SystemExit."""
+    cfg = c.read(f"database/config/{name}")["data"]
+    user = cfg["connection_details"].get("username")
+    if user != "vault_manager":
+        raise SystemExit(
+            f"connection {name!r} uses account {user!r}, not 'vault_manager': refusing to continue. "
+            f"Delete it (vault delete database/config/{name}) and re-run setup"
+        )
+    probe_role = f"vdba_probe_{name}"
+    c.write(
+        f"database/roles/{probe_role}",
+        db_name=name,
+        creation_statements=PROBES[name],
+        revocation_statements=["SELECT 1"],
+        default_ttl="30s",
+        max_ttl="30s",
+    )
+    lease = None
+    try:
+        lease = c.read(f"database/creds/{probe_role}")["lease_id"]
+    except vexc.VaultError as exc:
+        raise SystemExit(
+            f"connection {name!r} failed the least-privilege probe (superuser-like rights?): refusing. {exc}"
+        ) from exc
+    finally:
+        if lease:
+            c.write(f"sys/leases/revoke/{lease}")
+        c.delete(f"database/roles/{probe_role}")
+    log(f"connection {name!r} verified: account vault_manager, no superuser-like rights")
+
+
+def pg_sslmode() -> str:
+    mode = os.environ.get("VDBA_PG_SSLMODE", "")
+    if mode:
+        return mode
+    if os.environ.get("VDBA_PG_SSLROOTCERT"):
+        return "verify-full"
+    if os.environ.get("VDBA_ALLOW_INSECURE") != "1":
+        raise SystemExit(
+            "no TLS configured for Postgres: set VDBA_PG_SSLMODE (e.g. verify-full) or VDBA_PG_SSLROOTCERT, "
+            "or set VDBA_ALLOW_INSECURE=1 to accept plain text on the internal network (demo only)"
+        )
+    return "disable"
+
+
 def ensure_connection(c: hvac.Client, name: str, plugin: str, url: str, user: str, password: str) -> None:
     if c.read(f"database/config/{name}") is not None:
-        log(f"connection {name!r} already configured; leaving it (it may have been rotated)")
+        log(f"connection {name!r} already configured; validating it (it may have been rotated)")
+        validate_connection(c, name)
         return
     c.write(
         f"database/config/{name}",
@@ -167,7 +234,7 @@ def ensure_connection(c: hvac.Client, name: str, plugin: str, url: str, user: st
         password_policy=config.PASSWORD_POLICY_NAME,
         verify_connection=True,
     )
-    log(f"connection {name!r} configured (as non-superuser {user!r}, connection verified)")
+    validate_connection(c, name)
 
 
 def ensure_connections(c: hvac.Client, env: dict[str, str]) -> None:
@@ -176,7 +243,8 @@ def ensure_connections(c: hvac.Client, env: dict[str, str]) -> None:
         "postgres",
         "postgresql-database-plugin",
         f"postgresql://{{{{username}}}}:{{{{password}}}}@{config.POSTGRES_HOST}:{config.POSTGRES_PORT}/"
-        f"{config.POSTGRES_DB}?sslmode=disable",
+        f"{config.POSTGRES_DB}?sslmode={pg_sslmode()}"
+        + (f"&sslrootcert={os.environ['VDBA_PG_SSLROOTCERT']}" if os.environ.get("VDBA_PG_SSLROOTCERT") else ""),
         "vault_manager",
         env["PG_MANAGER_PASSWORD"],
     )
@@ -208,6 +276,7 @@ def ensure_policies_and_roles(c: hvac.Client, env: dict[str, str]) -> None:
         renewable=False,
         token_no_default_policy=True,
         token_type="service",
+        token_explicit_max_ttl=f"{int(os.environ.get('VDBA_TTL_MAX_SECONDS', config.TTL_MAX)) + 3600}s",
     )
     auth = c.sys.list_auth_methods()["data"]
     if "userpass/" not in auth:
@@ -273,6 +342,18 @@ def self_check() -> None:
     log("self-check ok: AppRole login works; policy/config writes are forbidden")
 
 
+def mint_test_admin(c: hvac.Client) -> None:
+    """TEST STACKS ONLY (VDBA_TEST_HOOKS=1, i.e. `make check`): the integration tests need a privileged token
+    to create/delete Vault users and inspect tokens, and Vault 2.x offers no unauthenticated generate-root.
+    It is a 2 h non-root token written to ./secrets/test-admin-token; the real root token is still revoked."""
+    c.sys.create_or_update_policy(
+        "vdba-test-admin", 'path "*" { capabilities = ["create","read","update","delete","list","sudo"] }'
+    )
+    tok = c.auth.token.create(policies=["vdba-test-admin"], ttl="2h", no_parent=True, renewable=False)
+    write_private(SECRETS / "test-admin-token", tok["auth"]["client_token"])
+    log("TEST HOOKS ON: wrote a 2 h test-admin token to secrets/test-admin-token (never do this in production)")
+
+
 def revoke_root(c: hvac.Client, keep: bool) -> None:
     if keep:
         log("--keep-root: root token left in place (revoke it yourself when done)")
@@ -318,6 +399,8 @@ def main() -> None:
     ensure_policies_and_roles(root, env)
     deliver_approle(root)
     self_check()
+    if os.environ.get("VDBA_TEST_HOOKS") == "1":
+        mint_test_admin(root)
     revoke_root(root, args.keep_root)
     log(f"done: portal admin is {env['VDBA_ADMIN_USER']!r}; the middleware can now log in via AppRole")
 

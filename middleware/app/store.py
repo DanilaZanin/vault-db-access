@@ -1,6 +1,7 @@
 """SQLite grant store: staged operations + audit log. Never holds passwords or tokens
 (except the portal's own server-side sessions, which hold the admin's own Vault login token)."""
 
+import hashlib
 import json
 import os
 import secrets
@@ -58,19 +59,33 @@ _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
 
 
+def _harden_files(path: str) -> None:
+    """DB and WAL/SHM sidecars may hold session ids and admin Vault tokens: owner-only, always."""
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.chmod(path + suffix, 0o600)
+        except FileNotFoundError:
+            pass
+
+
 def init(path: str | None = None) -> None:
     global _conn
+    db_path = path or config.DB_PATH
+    os.umask(0o077)  # every file SQLite creates from now on is 0600
+    directory = os.path.dirname(db_path) or "."
+    if path is None:
+        os.chmod(directory, 0o700)
+    os.close(os.open(db_path, os.O_CREAT | os.O_RDWR, 0o600))  # pre-create the main file as 0600
     with _lock:
         if _conn is not None:
             _conn.close()
-        _conn = sqlite3.connect(path or config.DB_PATH, check_same_thread=False, isolation_level=None)
+        _conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=FULL")
         _conn.execute("PRAGMA busy_timeout=5000")
         _conn.executescript(SCHEMA)
-        if path is None:
-            os.chmod(config.DB_PATH, 0o600)
+        _harden_files(db_path)
 
 
 @contextmanager
@@ -152,6 +167,18 @@ def list_grants(statuses: tuple[str, ...] | None = None, limit: int = 200) -> li
         return [_row(r) for r in rows]  # type: ignore[misc]
 
 
+def list_by_status(statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+    """All rows in the given statuses, oldest first, no global LIMIT (used by the reconciler)."""
+    with _lock:
+        assert _conn is not None
+        q = ",".join("?" * len(statuses))
+        rows = _conn.execute(
+            f"SELECT * FROM grants WHERE status IN ({q}) ORDER BY created_at",  # noqa: S608
+            statuses,
+        ).fetchall()
+        return [_row(r) for r in rows]  # type: ignore[misc]
+
+
 # ---- audit --------------------------------------------------------------------------------
 
 
@@ -175,17 +202,22 @@ def audit_exists(action: str, detail: str) -> bool:
 # ---- sessions -----------------------------------------------------------------------------
 
 
+def _h(sid: str) -> str:
+    """Only a hash of the session id is stored: a copy of the DB cannot be replayed as cookies."""
+    return hashlib.sha256(sid.encode()).hexdigest()
+
+
 def create_session(username: str, vault_token: str) -> tuple[str, str]:
     sid, csrf, now = secrets.token_urlsafe(32), secrets.token_urlsafe(32), time.time()
     with _tx() as c:
-        c.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)", (sid, username, csrf, vault_token, now, now, now))
+        c.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)", (_h(sid), username, csrf, vault_token, now, now, now))
     return sid, csrf
 
 
 def get_session(sid: str) -> dict[str, Any] | None:
     with _lock:
         assert _conn is not None
-        r = _conn.execute("SELECT * FROM sessions WHERE sid = ?", (sid,)).fetchone()
+        r = _conn.execute("SELECT * FROM sessions WHERE sid = ?", (_h(sid),)).fetchone()
         return dict(r) if r else None
 
 
@@ -193,14 +225,14 @@ def touch_session(sid: str, checked: bool = False) -> None:
     now = time.time()
     with _tx() as c:
         if checked:
-            c.execute("UPDATE sessions SET last_seen = ?, last_check = ? WHERE sid = ?", (now, now, sid))
+            c.execute("UPDATE sessions SET last_seen = ?, last_check = ? WHERE sid = ?", (now, now, _h(sid)))
         else:
-            c.execute("UPDATE sessions SET last_seen = ? WHERE sid = ?", (now, sid))
+            c.execute("UPDATE sessions SET last_seen = ? WHERE sid = ?", (now, _h(sid)))
 
 
 def delete_session(sid: str) -> None:
     with _tx() as c:
-        c.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+        c.execute("DELETE FROM sessions WHERE sid = ?", (_h(sid),))
 
 
 def purge_sessions() -> list[dict[str, Any]]:

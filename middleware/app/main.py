@@ -41,6 +41,10 @@ async def lifespan(_: FastAPI):
 api = FastAPI(title="Vault DB Access", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
+class TooLarge(Exception):
+    pass
+
+
 class Guard:
     """Pure-ASGI wrapper: request id, body-size limit, security headers."""
 
@@ -58,12 +62,22 @@ class Guard:
         headers = {k.lower(): v for k, v in scope["headers"]}
         rid = uuid.uuid4().hex[:12]
         scope.setdefault("state", {})["request_id"] = rid
-        if scope["method"] in {"POST", "PUT", "PATCH"}:
-            length = headers.get(b"content-length")
-            if length is None or not length.isdigit():
-                return await self._reject(send, rid, 411, "Content-Length required")
-            if int(length) > config.BODY_LIMIT:
-                return await self._reject(send, rid, 413, "request body too large")
+        te, length = headers.get(b"transfer-encoding"), headers.get(b"content-length")
+        if te is not None and length is not None:  # request-smuggling shape: never trust either
+            return await self._reject(send, rid, 400, "Transfer-Encoding and Content-Length together")
+        if length is not None and (not length.isdigit() or int(length) > config.BODY_LIMIT):
+            return await self._reject(send, rid, 413, "request body too large")
+        received = 0
+
+        async def counting_receive():
+            # Count real bytes on the stream: Content-Length alone proves nothing for chunked bodies.
+            nonlocal received
+            msg = await receive()
+            if msg["type"] == "http.request":
+                received += len(msg.get("body", b""))
+                if received > config.BODY_LIMIT:
+                    raise TooLarge()
+            return msg
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
@@ -79,7 +93,7 @@ class Guard:
                 ]
             await send(message)
 
-        await self.inner(scope, receive, send_wrapper)
+        await self.inner(scope, counting_receive, send_wrapper)
 
     @staticmethod
     async def _reject(send, rid, status, text):
@@ -104,6 +118,11 @@ class Guard:
 
 class NotAuthenticated(Exception):
     pass
+
+
+@api.exception_handler(TooLarge)
+def _too_large(request: Request, _: TooLarge):
+    return JSONResponse({"detail": "request body too large"}, status_code=413)
 
 
 def _wants_json(request: Request) -> bool:
@@ -152,11 +171,15 @@ def _set_cookie(request: Request, response: Response, name: str, value: str, max
 
 
 def check_origin(request: Request) -> None:
+    """State-changing requests must prove they are same-origin: a browser always sends Origin and/or
+    Sec-Fetch-Site; API clients must send `Origin` equal to the Host they call. Neither present = reject."""
     site = request.headers.get("sec-fetch-site")
+    origin = request.headers.get("origin")
     if site and site not in {"same-origin", "none"}:
         raise HTTPException(403, "cross-site request rejected")
-    origin = request.headers.get("origin")
-    if origin is None:
+    if not origin and not site:
+        raise HTTPException(403, "Origin header required")
+    if not origin:
         return
     allowed = {request.headers.get("host", "")} | {urlsplit(o).netloc for o in config.EXTRA_ORIGINS}
     if config.PUBLIC_ORIGIN:
@@ -189,9 +212,14 @@ def current_session(request: Request) -> dict | None:
         return None
     checked = False
     if now - s["last_check"] > config.SESSION_RECHECK_SECONDS:
-        policies = vault_client.token_policies(s["vault_token"])
-        if not policies or config.ADMIN_POLICY_NAME not in policies:
+        # Re-validate against the CURRENT state: the token's own policy list is frozen at login, so
+        # deleting the user or removing db-access-admin would otherwise go unnoticed.
+        current = vault_client.user_policies(s["username"])
+        alive = vault_client.token_policies(s["vault_token"])
+        if not current or config.ADMIN_POLICY_NAME not in current or not alive:
             store.delete_session(sid)
+            vault_client.revoke_token_quietly(s["vault_token"])
+            store.audit(None, None, s["username"], "session", "ended", "admin rights removed")
             return None
         checked = True
     store.touch_session(sid, checked)
@@ -218,7 +246,7 @@ def _page(request: Request, name: str, ctx: dict, status: int = 200) -> Response
 
 @api.get("/healthz")
 def healthz():
-    return {"status": "ok", "test_hooks": config.TEST_HOOKS}
+    return {"status": "ok", "test_hooks": config.TEST_HOOKS, "recheck": config.SESSION_RECHECK_SECONDS}
 
 
 @api.get("/login", response_class=HTMLResponse)
@@ -229,6 +257,43 @@ def login_form(request: Request, error: str | None = None):
     return resp
 
 
+def _login_page(request: Request, msg: str, status: int, username: str = "") -> Response:
+    store.audit(request.state.request_id, None, username[:64], "login", "denied", msg)
+    new_pre = secrets.token_urlsafe(32)
+    r = _page(request, "login.html", {"error": msg, "csrf": new_pre}, status)
+    _set_cookie(request, r, PRE_COOKIE, new_pre, 1800)
+    return r
+
+
+def _do_login(request: Request, username: str, password: str) -> Response:
+    """Blocking work (Vault + SQLite) runs in the threadpool, under its own admission limit."""
+    try:
+        with grants.admit("auth"):
+            if not username or not password or len(username) > 128 or len(password) > 512:
+                return _login_page(request, "Invalid credentials", 401, username)
+            try:
+                token, policies = vault_client.userpass_login(username, password)
+            except PermissionError:
+                return _login_page(request, "Invalid credentials", 401, username)
+            if config.ADMIN_POLICY_NAME not in policies:
+                vault_client.revoke_token_quietly(token)
+                return _login_page(request, "This account is not a portal administrator", 403, username)
+            old = request.cookies.get(COOKIE)
+            if old:  # login always issues a fresh session id; the previous session's Vault token dies too
+                prev = store.get_session(old)
+                store.delete_session(old)
+                if prev:
+                    vault_client.revoke_token_quietly(prev["vault_token"])
+            sid, _ = store.create_session(username, token)
+            store.audit(request.state.request_id, None, username, "login", "ok")
+    except grants.Busy as exc:
+        raise HTTPException(503, str(exc)) from exc
+    resp = RedirectResponse("/", status_code=303)
+    _set_cookie(request, resp, COOKIE, sid, config.SESSION_ABSOLUTE_SECONDS)
+    resp.delete_cookie(PRE_COOKIE, path="/")
+    return resp
+
+
 @api.post("/login")
 async def login_submit(request: Request):
     check_origin(request)
@@ -236,56 +301,41 @@ async def login_submit(request: Request):
     pre = request.cookies.get(PRE_COOKIE, "")
     if not pre or not hmac.compare_digest(str(form.get("csrf_token", "")), pre):
         raise HTTPException(403, "missing or invalid CSRF token")
-    username, password = str(form.get("username", "")), str(form.get("password", ""))
-
-    def fail(msg: str, status: int):
-        store.audit(request.state.request_id, None, username[:64], "login", "denied", msg)
-        new_pre = secrets.token_urlsafe(32)
-        r = _page(request, "login.html", {"error": msg, "csrf": new_pre}, status)
-        _set_cookie(request, r, PRE_COOKIE, new_pre, 1800)
-        return r
-
-    if not username or not password or len(username) > 128 or len(password) > 512:
-        return fail("Invalid credentials", 401)
-    try:
-        token, policies = await run_in_threadpool(vault_client.userpass_login, username, password)
-    except PermissionError:
-        return fail("Invalid credentials", 401)
-    if config.ADMIN_POLICY_NAME not in policies:
-        await run_in_threadpool(vault_client.revoke_token_quietly, token)
-        return fail("This account is not a portal administrator", 403)
-    old = request.cookies.get(COOKIE)
-    if old:
-        store.delete_session(old)  # login always issues a fresh session id
-    sid, _ = store.create_session(username, token)
-    store.audit(request.state.request_id, None, username, "login", "ok")
-    resp = RedirectResponse("/", status_code=303)
-    _set_cookie(request, resp, COOKIE, sid, config.SESSION_ABSOLUTE_SECONDS)
-    resp.delete_cookie(PRE_COOKIE, path="/")
-    return resp
+    return await run_in_threadpool(_do_login, request, str(form.get("username", "")), str(form.get("password", "")))
 
 
-@api.post("/logout")
-async def logout(request: Request, s: dict = Depends(require_admin)):
-    store.delete_session(s["sid"])
-    await run_in_threadpool(vault_client.revoke_token_quietly, s["vault_token"])
+def _do_logout(request: Request, s: dict) -> Response:
+    sid = request.cookies.get(COOKIE, "")
+    store.delete_session(sid)
+    vault_client.revoke_token_quietly(s["vault_token"])
     store.audit(request.state.request_id, None, s["username"], "logout", "ok")
     resp = RedirectResponse("/login", status_code=303)
     resp.delete_cookie(COOKIE, path="/")
     return resp  # issued grants are owned by per-grant tokens, so they survive the logout
 
 
+@api.post("/logout")
+async def logout(request: Request, s: dict = Depends(require_admin)):
+    return await run_in_threadpool(_do_logout, request, s)
+
+
 # ---- UI ---------------------------------------------------------------------------------------
 
 
 def _index(request: Request, s: dict, result=None, error=None, status: int = 200) -> Response:
-    try:
-        pg = db_introspect.postgres_catalog().tables
-        ch = db_introspect.clickhouse_catalog().tables
-    except Exception as exc:  # noqa: BLE001
-        log.warning("catalog lookup failed: %s", type(exc).__name__)
-        pg, ch = [], []
-        error = error or "Could not list tables (database unreachable?)"
+    tables: dict[DbType, list[str]] = {}
+    for db in DbType:  # one database being down must not hide the other one's tables
+        try:
+            with grants.admit("issue"):
+                tables[db] = db_introspect.catalog(db).tables
+        except grants.Busy:
+            tables[db] = []
+            error = error or "Server busy, try again"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("catalog lookup for %s failed: %s", db.value, type(exc).__name__)
+            tables[db] = []
+            error = error or f"Could not list {db.value} tables (database unreachable?)"
+    pg, ch = tables[DbType.postgres], tables[DbType.clickhouse]
     return _page(
         request,
         "index.html",
@@ -313,7 +363,8 @@ async def index(request: Request, s: dict = Depends(require_admin)):
 
 def _issue(request: Request, s: dict, req: GrantRequest) -> dict:
     try:
-        return grants.issue(req, s["username"], request.state.request_id)
+        with grants.admit("issue"):
+            return grants.issue(req, s["username"], request.state.request_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except grants.Busy as exc:
@@ -321,6 +372,7 @@ def _issue(request: Request, s: dict, req: GrantRequest) -> dict:
     except vault_client.VaultUnavailable:
         raise
     except Exception as exc:
+        log.warning("issue failed: %s: %s", type(exc).__name__, exc)
         raise HTTPException(502, f"issuing failed and was rolled back (request {request.state.request_id})") from exc
 
 
@@ -351,8 +403,12 @@ async def create_grant_form(request: Request, s: dict = Depends(require_admin)):
 @api.post("/grants/{grant_id}/revoke")
 @api.post("/api/grants/{grant_id}/revoke")
 async def revoke_grant(request: Request, grant_id: str = GRANT_ID, s: dict = Depends(require_admin)):
+    def work():
+        with grants.admit("revoke"):
+            return grants.revoke(grant_id, s["username"], request.state.request_id)
+
     try:
-        g = await run_in_threadpool(grants.revoke, grant_id, s["username"], request.state.request_id)
+        g = await run_in_threadpool(work)
     except grants.NotFound as exc:
         raise HTTPException(404, "grant not found") from exc
     except grants.Busy as exc:
@@ -390,8 +446,14 @@ def api_list_grants(_: dict = Depends(require_admin)):
 
 @api.get("/api/tables/{db_type}")
 async def api_list_tables(db_type: DbType, _: dict = Depends(require_admin)):
-    cat = await run_in_threadpool(db_introspect.catalog, db_type)
-    return {"tables": cat.tables}
+    def work():
+        with grants.admit("issue"):
+            return db_introspect.catalog(db_type).tables
+
+    try:
+        return {"tables": await run_in_threadpool(work)}
+    except grants.Busy as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 # ---- settings (rotation only: connection config is written by setup, never by the UI) ---------
@@ -404,14 +466,22 @@ def settings_page(request: Request, message: str | None = None, s: dict = Depend
 
 @api.post("/settings/{db_type}/rotate")
 async def rotate_connection(request: Request, db_type: DbType, s: dict = Depends(require_admin)):
+    def work():
+        with grants.admit("issue"):
+            try:
+                vault_client.rotate_root(db_type)
+            except vault_client.VaultUnavailable:
+                raise
+            except Exception as exc:
+                store.audit(request.state.request_id, None, s["username"], "rotate", "error", db_type.value)
+                log.warning("rotate %s failed: %s", db_type.value, exc)
+                raise HTTPException(502, f"rotation failed (request {request.state.request_id})") from exc
+            store.audit(request.state.request_id, None, s["username"], "rotate", "ok", db_type.value)
+
     try:
-        await run_in_threadpool(vault_client.rotate_root, db_type)
-    except vault_client.VaultUnavailable:
-        raise
-    except Exception as exc:
-        store.audit(request.state.request_id, None, s["username"], "rotate", "error", db_type.value)
-        raise HTTPException(502, f"rotation failed (request {request.state.request_id})") from exc
-    store.audit(request.state.request_id, None, s["username"], "rotate", "ok", db_type.value)
+        await run_in_threadpool(work)
+    except grants.Busy as exc:
+        raise HTTPException(503, str(exc)) from exc
     if _wants_json(request):
         return {"status": "rotated", "db_type": db_type.value}
     return RedirectResponse(f"/settings?message=Manager+credential+for+{db_type.value}+rotated", status_code=303)

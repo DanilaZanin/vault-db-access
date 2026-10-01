@@ -95,3 +95,24 @@ def leftover_users(db_type: DbType) -> list[str]:
             return [r[0] for r in conn.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE %s", (pattern,))]
     res = _ch_client().query("SELECT name FROM system.users WHERE name LIKE %(p)s", parameters={"p": pattern})
     return [r[0] for r in res.result_rows]
+
+
+def find_accounts(db_type: DbType, grant_id: str) -> list[str]:
+    """Database accounts that belong to one grant (Vault's username template is <grant id>_<random>)."""
+    prefix = grant_id + "_"
+    if db_type == DbType.postgres:
+        with _pg_connect() as conn:
+            rows = conn.execute("SELECT rolname FROM pg_roles WHERE starts_with(rolname, %s)", (prefix,)).fetchall()
+    else:
+        rows = (
+            _ch_client()
+            .query("SELECT name FROM system.users WHERE startsWith(name, %(p)s)", parameters={"p": prefix})
+            .result_rows
+        )
+    return [r[0] for r in rows]
+
+
+def pg_backends(account: str) -> int:
+    """Live backends of a role, from pg_stat_activity (not from what any SQL text claims)."""
+    with _pg_connect() as conn:
+        return conn.execute("SELECT count(*) FROM pg_stat_activity WHERE usename = %s", (account,)).fetchone()[0]

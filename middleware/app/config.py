@@ -21,6 +21,8 @@ CLICKHOUSE_HTTP_PORT = _int("VDBA_CLICKHOUSE_HTTP_PORT", 8123)
 CLICKHOUSE_NATIVE_PORT = _int("VDBA_CLICKHOUSE_NATIVE_PORT", 9000)
 CLICKHOUSE_DB = "appdb"
 DB_TIMEOUT = 8
+# Transport to Postgres. The demo runs plain on the internal docker network and needs VDBA_ALLOW_INSECURE=1.
+PG_SSLMODE = os.environ.get("VDBA_PG_SSLMODE", "")
 
 # Names of the objects created by `app.setup`.
 CONNECTION_NAMES = {"postgres": "postgres", "clickhouse": "clickhouse"}
@@ -35,15 +37,19 @@ ROLE_PREFIX = "vdba_"  # Vault role names and DB usernames start with this
 TTL_MIN = _int("VDBA_TTL_MIN_SECONDS", 10)
 TTL_MAX = _int("VDBA_TTL_MAX_SECONDS", 86400)
 TOKEN_GRACE_SECONDS = 120  # grant token outlives the lease by this much
+HELPER_TTL_SECONDS = 60  # lifetime of the one-shot "run these statements as the manager" roles/tokens
 
 ALLOWED_POSTGRES_COMMANDS = ["SELECT", "INSERT", "UPDATE", "DELETE"]
 ALLOWED_CLICKHOUSE_COMMANDS = ["SELECT", "INSERT", "ALTER UPDATE", "ALTER DELETE"]
 
 SESSION_ABSOLUTE_SECONDS = 8 * 3600
 SESSION_IDLE_SECONDS = 30 * 60
-SESSION_RECHECK_SECONDS = 5 * 60
+SESSION_RECHECK_SECONDS = _int("VDBA_SESSION_RECHECK_SECONDS", 5 * 60)
 BODY_LIMIT = 64 * 1024
-MAX_CONCURRENT_OPS = 8
+# Admission limits (checked BEFORE any backend I/O; over the limit -> immediate 503).
+MAX_ISSUE_OPS = 6  # issue, catalog reads, rotate
+MAX_REVOKE_OPS = 4  # reserved so a flood of issues can never starve revocation
+MAX_AUTH_OPS = 4  # logins
 
 RECONCILE_INTERVAL = _int("VDBA_RECONCILE_INTERVAL", 60)
 TEST_HOOKS = os.environ.get("VDBA_TEST_HOOKS") == "1"

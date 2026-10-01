@@ -22,7 +22,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/clickhouse-database-plug
 FROM hashicorp/vault:2.1.1
 
 USER root
-RUN mkdir -p /vault/plugins /vault/logs && chown vault:vault /vault/plugins /vault/logs
+RUN apk upgrade --no-cache \
+    && mkdir -p /vault/plugins /vault/logs && chown vault:vault /vault/plugins /vault/logs
 # Plugin is baked into the image (no shared volume that could shadow it). The sha256 file is
 # read by the setup container (via a compose additional_context) to register the plugin.
 COPY --from=plugin-builder --chown=root:root --chmod=0755 /out/clickhouse-database-plugin /vault/plugins/clickhouse-database-plugin

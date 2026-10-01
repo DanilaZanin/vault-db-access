@@ -1,18 +1,23 @@
-FROM python:3.12-slim
-
-ENV PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv
+# ---- build stage: uv lives only here ----
+FROM python:3.12-slim AS build
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv
 RUN pip install --no-cache-dir uv==0.11.14
 WORKDIR /app
-
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-ENV PATH="/opt/venv/bin:$PATH"
 
+# ---- runtime stage: no uv, no pip-installed tooling, OS packages upgraded ----
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:$PATH"
+RUN apt-get update && apt-get -y upgrade && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && pip uninstall -y pip setuptools wheel 2>/dev/null; true
+WORKDIR /app
+COPY --from=build /opt/venv /opt/venv
 COPY middleware/app ./app
 # sha256 of the plugin baked into the vault image (used by `app.setup` to register it)
 COPY --from=vaultimg /vault/plugins/clickhouse-database-plugin.sha256 /opt/vdba/clickhouse-plugin.sha256
 
-RUN useradd --create-home --uid 1000 appuser && mkdir /data && chown appuser /data
+RUN useradd --create-home --uid 1000 appuser && mkdir /data && chown appuser /data && chmod 700 /data
 USER appuser
 
 EXPOSE 8000

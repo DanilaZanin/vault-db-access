@@ -2,6 +2,7 @@
 VDBA_TEST_HOOKS=1 VDBA_RECONCILE_INTERVAL=5 as `make check` does). If the stack is not running
 every test here is skipped, so `make test` stays green on a bare checkout."""
 
+import os
 import re
 import subprocess
 import time
@@ -31,6 +32,9 @@ def load_env() -> dict[str, str]:
 
 
 ENV = load_env()
+# `make check` sets this: the security gate must FAIL, never silently skip, when the stack is unreachable.
+REQUIRE_STACK = os.environ.get("VDBA_REQUIRE_STACK") == "1"
+_skipped_for_stack = False
 
 
 def dc(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -75,6 +79,7 @@ class Portal:
         r = self.s.post(
             f"{BASE}/login",
             data={"csrf_token": token, "username": self.username, "password": self.password},
+            headers={"Origin": BASE},
             allow_redirects=False,
             timeout=30,
         )
@@ -82,7 +87,7 @@ class Portal:
         self.csrf = self.s.get(f"{BASE}/api/session", timeout=10).json()["csrf_token"]
 
     def post(self, path: str, json=None, headers=None, **kw) -> requests.Response:
-        h = {"X-CSRF-Token": self.csrf, **(headers or {})}
+        h = {"X-CSRF-Token": self.csrf, "Origin": BASE, **(headers or {})}
         return self.s.post(f"{BASE}{path}", json=json if json is not None else {}, headers=h, timeout=60, **kw)
 
     def get(self, path: str, **kw) -> requests.Response:
@@ -107,19 +112,49 @@ class Portal:
 
 @pytest.fixture(scope="session", autouse=True)
 def stack():
+    global _skipped_for_stack
     try:
         h = requests.get(f"{BASE}/healthz", timeout=3).json()
     except Exception:  # noqa: BLE001
+        if REQUIRE_STACK:
+            pytest.fail(
+                "compose stack is NOT reachable but VDBA_REQUIRE_STACK=1: the security gate cannot pass", pytrace=False
+            )
+        _skipped_for_stack = True
         pytest.skip("compose stack is not running (make up)")
     if not ENV:
-        pytest.skip(".env not found")
+        pytest.fail(".env not found", pytrace=False) if REQUIRE_STACK else pytest.skip(".env not found")
     return h
+
+
+def pytest_terminal_summary(terminalreporter):
+    if _skipped_for_stack:
+        terminalreporter.write_sep(
+            "!", "INTEGRATION TESTS WERE SKIPPED: no running stack. This is NOT a security check."
+        )
+        terminalreporter.write_line("Run `make check` (fresh stack, fails if the stack is unreachable).")
 
 
 @pytest.fixture(scope="session")
 def hooks(stack):
     if not stack.get("test_hooks"):
+        if REQUIRE_STACK:
+            pytest.fail("stack started without VDBA_TEST_HOOKS=1 but VDBA_REQUIRE_STACK=1", pytrace=False)
         pytest.skip("stack started without VDBA_TEST_HOOKS=1")
+
+
+@pytest.fixture(scope="session")
+def root_token(stack):
+    """A privileged non-root token minted by setup ONLY on test stacks (VDBA_TEST_HOOKS=1; Vault 2.x has no
+    unauthenticated generate-root). The real root token stays revoked (see test_02c)."""
+    f = ROOT / "secrets" / "test-admin-token"
+    if not f.exists():
+        if REQUIRE_STACK:
+            pytest.fail(
+                "secrets/test-admin-token missing: start the stack with VDBA_TEST_HOOKS=1 (make check)", pytrace=False
+            )
+        pytest.skip("no test-admin token (stack not started with VDBA_TEST_HOOKS=1)")
+    return f.read_text().strip()
 
 
 @pytest.fixture(scope="session")

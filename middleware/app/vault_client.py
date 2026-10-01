@@ -1,6 +1,7 @@
 """All Vault access for the running portal goes through the middleware's own AppRole identity.
 Admin tokens are only ever used to check "who is this" at login."""
 
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -48,7 +49,13 @@ class Service:
             c.auth.approle.login(role_id=role_id, secret_id=secret_id)
         except (vexc.VaultError, OSError) as exc:
             raise VaultUnavailable(f"AppRole login failed: {type(exc).__name__}") from exc
+        old = self._client
         self._client, self._logged_in_at = c, time.time()
+        if old is not None:  # do not leave the previous service token alive until its TTL
+            try:
+                old.auth.token.revoke_self()
+            except Exception:  # noqa: BLE001, S110
+                pass
         return c
 
     def client(self) -> hvac.Client:
@@ -95,16 +102,32 @@ def delete_role(role: str) -> None:
     service.call(lambda c: c.delete(f"database/roles/{role}"))
 
 
-def create_grant_token(ttl: int) -> tuple[str, str]:
-    """Orphan service token that will own exactly this grant's lease. Returns (token, accessor)."""
+def create_grant_token(ttl: int, label: str) -> tuple[str, str]:
+    """Orphan service token that will own exactly this grant's lease. Returns (token, accessor).
+    `label` (the grant id) becomes the token's display name so a token whose create response was
+    lost can still be found and revoked (see find_token_accessors)."""
     resp = service.call(
         lambda c: c.write(
             f"auth/token/create/{config.TOKEN_ROLE_NAME}",
             ttl=f"{ttl + config.TOKEN_GRACE_SECONDS}s",
-            display_name="vdba-grant",
+            display_name=label,
         )
     )
     return resp["auth"]["client_token"], resp["auth"]["accessor"]
+
+
+def find_token_accessors(label: str) -> list[str]:
+    """Accessors of live tokens whose display name is `label` (recovery path only; O(live tokens))."""
+    resp = service.call(lambda c: c.list("auth/token/accessors"))
+    found = []
+    for acc in (resp or {}).get("data", {}).get("keys", [])[:20000]:
+        try:
+            info = service.call(lambda c, a=acc: c.write("auth/token/lookup-accessor", accessor=a))
+        except vexc.VaultError:
+            continue  # expired/revoked between list and lookup
+        if info["data"].get("display_name") in (f"token-{label}", label):
+            found.append(acc)
+    return found
 
 
 def read_credentials(grant_token: str, role: str) -> dict[str, Any]:
@@ -144,6 +167,26 @@ def revoke_accessor(accessor: str) -> None:
             raise
 
 
+def run_as_manager(db_type: DbType, label: str, statements: list[str]) -> None:
+    """Run fixed statements as the DB connection's manager account, via Vault (the middleware holds no
+    DB credentials): a one-shot role whose creation statements ARE the work, read once with a one-shot
+    token. Raises if any statement fails (so a successful return is a confirmation)."""
+    role = f"{label}"
+    ttl = config.HELPER_TTL_SECONDS
+    token = accessor = lease = None
+    try:
+        write_role(role, db_type, statements, ["SELECT 1"], ttl)
+        token, accessor = create_grant_token(ttl, role)
+        lease = read_credentials(token, role)["lease_id"]
+    finally:
+        for fn, arg in ((revoke_lease, lease), (revoke_accessor, accessor), (delete_role, role)):
+            if arg or fn is delete_role:
+                try:
+                    fn(arg or role)
+                except Exception:  # noqa: BLE001, S110 - expires on its own within HELPER_TTL
+                    pass
+
+
 def rotate_root(db_type: DbType) -> None:
     service.call(lambda c: c.write(f"database/rotate-root/{connection_name(db_type)}"))
 
@@ -169,6 +212,18 @@ def userpass_login(username: str, password: str) -> tuple[str, list[str]]:
     except (vexc.VaultError, OSError) as exc:
         raise VaultUnavailable(f"Vault unavailable: {type(exc).__name__}") from exc
     return r["auth"]["client_token"], r["auth"].get("token_policies", [])
+
+
+def user_policies(username: str) -> list[str] | None:
+    """CURRENT policies of a userpass user (None if the user no longer exists). Read by the service
+    identity: a token's own policy list is frozen at login and cannot show that rights were removed."""
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", username):
+        return None
+    try:
+        resp = service.call(lambda c: c.read(f"auth/userpass/users/{username}"))
+    except vexc.InvalidPath:
+        return None
+    return None if resp is None else list(resp["data"].get("token_policies") or [])
 
 
 def token_policies(token: str) -> list[str] | None:

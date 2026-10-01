@@ -9,13 +9,13 @@ SETUP_ARGS ?=
 .PHONY: env up setup test unit lint check down logs
 
 env:
-	@test -f .env && echo ".env exists, leaving it alone" || { \
-	  while IFS= read -r line; do \
-	    case "$$line" in \
-	      *=changeme) echo "$${line%=changeme}=$$(openssl rand -hex 24)";; \
-	      *) echo "$$line";; \
-	    esac; \
-	  done < .env.example > .env; chmod 600 .env; echo "wrote .env"; }
+	@touch .env && chmod 600 .env
+	@grep -v '^#' .env.example | grep '=' | while IFS= read -r line; do \
+	  key=$${line%%=*}; \
+	  grep -q "^$$key=" .env || { case "$$line" in \
+	    *=changeme) echo "$${line%=changeme}=$$(openssl rand -hex 24)" >> .env;; \
+	    *) echo "$$line" >> .env;; esac; echo "added $$key to .env"; }; \
+	done
 
 up: env
 	@mkdir -p secrets/approle && chmod 700 secrets
@@ -34,11 +34,13 @@ lint:
 	uv run ruff check . && uv run ruff format --check .
 
 test: unit
+	@curl -sf http://127.0.0.1:8000/healthz >/dev/null || { echo; echo "!!! No running stack: integration tests will be SKIPPED. That is NOT a security check; use 'make check'. !!!"; echo; }
 	uv run pytest tests/integration -q
 
 check: down
-	VDBA_TEST_HOOKS=1 VDBA_RECONCILE_INTERVAL=5 $(MAKE) up
-	$(MAKE) test
+	VDBA_TEST_HOOKS=1 VDBA_RECONCILE_INTERVAL=5 VDBA_SESSION_RECHECK_SECONDS=5 $(MAKE) up
+	uv run pytest tests/unit -q
+	VDBA_REQUIRE_STACK=1 uv run pytest tests/integration -q
 
 down:
 	$(COMPOSE) --profile setup down -v --remove-orphans

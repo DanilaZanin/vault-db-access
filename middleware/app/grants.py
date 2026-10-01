@@ -2,13 +2,15 @@
 crash at any point leaves enough information to clean up (see reconcile())."""
 
 import logging
+import secrets
 import threading
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from . import config, db_introspect, faults, store, vault_client
-from .models import TERMINAL, DbType, GrantRequest, Status
+from . import config, db_introspect, faults, statement_builder, store, vault_client
+from .models import DbType, GrantRequest, Status
 from .statement_builder import build_statements
 
 log = logging.getLogger("vdba.grants")
@@ -17,9 +19,13 @@ _db_locks = {
     DbType.postgres: threading.Lock(),
     DbType.clickhouse: threading.Lock(),
 }  # issue/revoke serialized per DB
-_ops = threading.BoundedSemaphore(config.MAX_CONCURRENT_OPS)
 _inflight: set[str] = set()
 _inflight_lock = threading.Lock()
+_admission = {
+    "issue": threading.BoundedSemaphore(config.MAX_ISSUE_OPS),
+    "revoke": threading.BoundedSemaphore(config.MAX_REVOKE_OPS),
+    "auth": threading.BoundedSemaphore(config.MAX_AUTH_OPS),
+}
 
 
 class Busy(Exception):
@@ -30,12 +36,22 @@ class NotFound(Exception):
     pass
 
 
+@contextmanager
+def admit(kind: str):
+    """Admission control BEFORE any backend I/O: over the limit -> immediate Busy (HTTP 503), never queueing
+    behind a slow backend. Revocation has its own reserved slots."""
+    sem = _admission[kind]
+    if not sem.acquire(blocking=False):
+        raise Busy(f"too many concurrent {kind} operations")
+    try:
+        yield
+    finally:
+        sem.release()
+
+
 def _begin(db_type: DbType, grant_id: str):
-    if not _ops.acquire(timeout=20):
-        raise Busy("too many concurrent operations")
     lock = _db_locks[db_type]
     if not lock.acquire(timeout=60):
-        _ops.release()
         raise Busy(f"another {db_type.value} operation is taking too long")
     with _inflight_lock:
         _inflight.add(grant_id)
@@ -46,7 +62,6 @@ def _end(lock, grant_id: str) -> None:
     with _inflight_lock:
         _inflight.discard(grant_id)
     lock.release()
-    _ops.release()
 
 
 def validate_ttl(ttl: int) -> None:
@@ -83,6 +98,7 @@ def issue(req: GrantRequest, actor: str, request_id: str) -> dict[str, Any]:
     creation, revocation = build_statements(
         req.db_type, req.scope, req.tables, req.commands, set(cat.tables), cat.sequences
     )
+    creation = faults.mutate_statements(creation)
     grant_id = store.new_grant_id()
     lock = _begin(req.db_type, grant_id)
     try:
@@ -101,7 +117,8 @@ def issue(req: GrantRequest, actor: str, request_id: str) -> dict[str, Any]:
         try:
             vault_client.write_role(grant_id, req.db_type, creation, revocation, req.ttl_seconds)
             faults.point("after_role_create")
-            token, accessor = vault_client.create_grant_token(req.ttl_seconds)
+            token, accessor = vault_client.create_grant_token(req.ttl_seconds, grant_id)
+            faults.point("after_token_create")  # the accessor is not stored yet: recovery finds it by name
             store.update_grant(grant_id, token_accessor=accessor)  # BEFORE the token is used
             creds = vault_client.read_credentials(token, grant_id)
             del token  # only ever held in this frame
@@ -142,27 +159,62 @@ def revoke(grant_id: str, actor: str, request_id: str) -> dict[str, Any]:
     return public(store.get_grant(grant_id))  # type: ignore[arg-type]
 
 
+def _run(db_type: DbType, grant_id: str, statements: list[str]) -> None:
+    if statements:
+        vault_client.run_as_manager(db_type, f"{grant_id}_h{secrets.token_hex(2)}", statements)
+
+
+def _lock_out_and_terminate(db_type: DbType, account: str, grant_id: str) -> None:
+    """PostgreSQL: committed NOLOGIN first, then terminate backends until pg_stat_activity shows none.
+    (ClickHouse: DROP USER is immediate and also ends open sessions.)"""
+    if db_type != DbType.postgres:
+        return
+    _run(db_type, grant_id, statement_builder.lockout_statements(db_type, account))
+    deadline = time.time() + 20
+    while db_introspect.pg_backends(account) > 0:
+        if time.time() > deadline:
+            raise RuntimeError(f"backends of {account} still alive after termination attempts")
+        _run(db_type, grant_id, statement_builder.terminate_statements(db_type, account))
+        time.sleep(0.3)
+
+
 def _teardown(
     grant_id: str, final: Status, request_id: str | None, actor: str = "system", raise_errors: bool = False
 ) -> None:
-    """Idempotent cleanup in the order: leases (sync, kills the DB account) -> token -> role.
-    On failure the row stays `revoking` with last_error so the reconciler retries."""
+    """Idempotent cleanup; anything already gone counts as done. Order:
+    find the grant's token(s) and DB accounts -> committed lockout + confirmed session termination ->
+    synchronous lease revoke (Vault runs the DB revocation statements) -> confirm the accounts are gone
+    (drop them as the manager if not, e.g. a partial CREATE USER with no lease) -> revoke token -> delete role.
+    On any failure the row stays `revoking` and the reconciler retries."""
     g = store.get_grant(grant_id)
     if g is None:
         return
+    db = DbType(g["db_type"])
     try:
+        accessors = {g["token_accessor"]} if g["token_accessor"] else set()
+        if not g["token_accessor"]:  # the create-token response may have been lost
+            accessors |= set(vault_client.find_token_accessors(grant_id))
+        accounts = db_introspect.find_accounts(db, grant_id)
+        for account in accounts:
+            _lock_out_and_terminate(db, account, grant_id)
         leases = set(vault_client.list_leases(grant_id))
         if g["lease_id"]:
             leases.add(g["lease_id"])
         for lease in sorted(leases):
             vault_client.revoke_lease(lease)
-        if g["token_accessor"]:
-            vault_client.revoke_accessor(g["token_accessor"])
+        for account in db_introspect.find_accounts(db, grant_id):
+            _lock_out_and_terminate(db, account, grant_id)
+            _run(db, grant_id, statement_builder.drop_statements(db, account))
+        left = db_introspect.find_accounts(db, grant_id)
+        if left:
+            raise RuntimeError(f"accounts still present after cleanup: {left}")
+        for accessor in accessors:
+            vault_client.revoke_accessor(accessor)
         vault_client.delete_role(grant_id)
     except Exception as exc:  # noqa: BLE001 - recorded and retried by the reconciler
-        store.update_grant(grant_id, status=Status.revoking.value, last_error=f"{type(exc).__name__}: {exc}"[:300])
+        log.warning("teardown of %s failed: %s: %s", grant_id, type(exc).__name__, exc)  # full text: server log only
+        store.update_grant(grant_id, status=Status.revoking.value, last_error=type(exc).__name__)
         store.audit(request_id, grant_id, actor, "teardown", "error", type(exc).__name__)
-        log.warning("teardown of %s failed: %s", grant_id, type(exc).__name__)
         if raise_errors:
             raise
         return
@@ -170,45 +222,55 @@ def _teardown(
     store.audit(request_id, grant_id, actor, "teardown", final.value)
 
 
+def _final_for(g: dict[str, Any], now: float) -> Status | None:
+    """What a row needs, decided from its CURRENT state (never from an earlier snapshot)."""
+    st = g["status"]
+    if st == Status.issuing.value:
+        return Status.failed
+    if st == Status.revoking.value:
+        return Status.revoked
+    if st == Status.active.value and g["expires_at"] and now > g["expires_at"] + 15:
+        return Status.expired
+    return None
+
+
+def reconcile_one(grant_id: str) -> None:
+    g = store.get_grant(grant_id)
+    if g is None:
+        return
+    lock = _begin(DbType(g["db_type"]), grant_id)
+    try:
+        fresh = store.get_grant(grant_id)  # re-read under the lock: an in-flight issue may have finished
+        final = _final_for(fresh, time.time()) if fresh else None
+        if final:
+            _teardown(grant_id, final, None)
+    finally:
+        _end(lock, grant_id)
+
+
 def reconcile_once() -> None:
     """Retry anything left half-done and finish expired grants. Safe to run at any time."""
     now = time.time()
-    rows = store.list_grants(limit=1000)
-    for g in rows:
+    for g in store.list_by_status((Status.issuing.value, Status.revoking.value, Status.active.value)):
         with _inflight_lock:
             if g["id"] in _inflight:
                 continue
-        st = g["status"]
-        if st == Status.issuing.value:
-            final = Status.failed
-        elif st == Status.revoking.value:
-            final = Status.revoked
-        elif st == Status.active.value and g["expires_at"] and now > g["expires_at"] + 15:
-            final = Status.expired
-        else:
-            continue
-        lock = _begin(DbType(g["db_type"]), g["id"])
-        try:
-            fresh = store.get_grant(g["id"])
-            if fresh and fresh["status"] not in {s.value for s in TERMINAL}:
-                _teardown(g["id"], final, None)
-        finally:
-            _end(lock, g["id"])
+        if _final_for(g, now) is not None:
+            try:
+                reconcile_one(g["id"])
+            except Exception:  # noqa: BLE001
+                log.exception("reconcile of %s failed", g["id"])
     for sess in store.purge_sessions():
         vault_client.revoke_token_quietly(sess["vault_token"])
     _report_orphans()
 
 
 def _report_orphans() -> None:
-    """DB accounts with our prefix that no live grant explains (e.g. a partial CREATE USER)."""
-    live = {
-        g["username"]
-        for g in store.list_grants(limit=1000)
-        if g["username"] and g["status"] in (Status.active.value, Status.revoking.value, Status.issuing.value)
-    }
-    pending = any(g["status"] == Status.issuing.value for g in store.list_grants((Status.issuing.value,)))
-    if pending:
+    """DB accounts with our prefix that no live grant explains."""
+    rows = store.list_by_status((Status.active.value, Status.revoking.value, Status.issuing.value))
+    if any(g["status"] == Status.issuing.value for g in rows):
         return
+    live = {g["username"] for g in rows if g["username"]}
     for db_type in DbType:
         try:
             names = db_introspect.leftover_users(db_type)
