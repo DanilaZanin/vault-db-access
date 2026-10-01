@@ -1,18 +1,22 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv
+RUN pip install --no-cache-dir uv==0.11.14
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+ENV PATH="/opt/venv/bin:$PATH"
 
-COPY app ./app
+COPY middleware/app ./app
+# sha256 of the plugin baked into the vault image (used by `app.setup` to register it)
+COPY --from=vaultimg /vault/plugins/clickhouse-database-plugin.sha256 /opt/vdba/clickhouse-plugin.sha256
 
-RUN useradd --create-home --uid 1000 appuser
+RUN useradd --create-home --uid 1000 appuser && mkdir /data && chown appuser /data
 USER appuser
 
 EXPOSE 8000
-
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/login', timeout=2)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)" || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]

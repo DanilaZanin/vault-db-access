@@ -1,7 +1,10 @@
 .env
-vault-init.json
+.env.*
+!.env.example
+secrets/
 *.tar
 __pycache__/
 .pytest_cache/
-secrets/
+.ruff_cache/
+.venv/
 dist/

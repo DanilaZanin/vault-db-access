@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Vault DB Access Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vault DB Access</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #222; }
     fieldset { margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 6px; }
@@ -26,11 +27,12 @@
     <div>
       {{ username }}
       <form method="post" action="/logout" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
         <button type="submit">Log out</button>
       </form>
     </div>
   </nav>
-  <h1>Vault DB Access Admin</h1>
+  <h1>Vault DB Access</h1>
 
   {% if error %}
   <div class="error"><strong>Error:</strong> {{ error }}</div>
@@ -39,19 +41,16 @@
   {% if result %}
   <div class="result">
     <strong>Grant issued</strong> for <strong>{{ result.requested_for }}</strong>:
-    <code>{{ result.role_name }}</code> (ttl {{ result.ttl_seconds }}s)
-    {% if result.username %}
-      <p>Login: <code>{{ result.username }}</code><br>Password: <code>{{ result.password }}</code></p>
-      <p>Connect directly with these credentials.</p>
-    {% else %}
-      <p>Vault token: <code>{{ result.vault_token }}</code></p>
-      <p>Give this to the end user. They log into the Vault UI with this token, then look up the path
-         <code>database/creds/{{ result.role_name }}</code> to see their login/password.</p>
-    {% endif %}
+    <code>{{ result.grant_id }}</code> (expires {{ result.expires_at }})
+    <p>Login: <code>{{ result.username }}</code><br>Password: <code>{{ result.password }}</code></p>
+    <p><strong>This password is shown once and is not stored anywhere.</strong> Connect directly with these credentials.</p>
+  </div>
+  {% endif %}
   </div>
   {% endif %}
 
   <form method="post" action="/grants">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
     <fieldset>
       <legend>New grant</legend>
 
@@ -66,7 +65,7 @@
 
       <label>Scope:
         <select name="scope">
-          <option value="database">Whole database</option>
+          <option value="database">All tables that exist now</option>
           <option value="tables">Specific tables</option>
         </select>
       </label>
@@ -100,17 +99,7 @@
         </div>
       </div>
 
-      <label><input type="checkbox" name="allow_create" value="true"> Allow creating new tables
-        (grantee gets full rights, including drop, on tables they create themselves)</label>
-
-      <label>Credential type:
-        <select name="credential_type">
-          <option value="password">Login + password (shown here directly)</option>
-          <option value="token">Vault token (end user logs into Vault UI)</option>
-        </select>
-      </label>
-
-      <label>Lifetime (seconds): <input type="number" name="ttl_seconds" value="3600" min="30"></label>
+      <label>Lifetime (seconds): <input type="number" name="ttl_seconds" value="3600" min="{{ ttl_min }}" max="{{ ttl_max }}"></label>
 
       <button type="submit">Issue grant</button>
     </fieldset>
@@ -142,25 +131,27 @@
     }
   </script>
 
-  <h2>Active grants</h2>
+  <h2>Grants</h2>
   <table>
-    <tr><th>Role</th><th>Issued to</th><th>Issued by</th><th>DB</th><th>Scope</th><th>Tables</th><th>Commands</th><th>Cred type</th><th>TTL</th><th>Created</th><th></th></tr>
+    <tr><th>Grant</th><th>Issued to</th><th>Issued by</th><th>DB</th><th>Scope</th><th>Tables</th><th>Commands</th><th>Status</th><th>Expires</th><th></th></tr>
     {% for g in grants %}
     <tr>
-      <td>{{ g.role_name }}</td>
+      <td>{{ g.grant_id }}</td>
       <td>{{ g.requested_for }}</td>
       <td>{{ g.issued_by }}</td>
       <td>{{ g.db_type }}</td>
       <td>{{ g.scope }}</td>
       <td>{{ g.tables | join(', ') }}</td>
       <td>{{ g.commands | join(', ') }}</td>
-      <td>{{ g.credential_type }}</td>
-      <td>{{ g.ttl_seconds }}s</td>
-      <td>{{ g.created_at }}</td>
+      <td>{{ g.status }}</td>
+      <td>{{ g.expires_at }}</td>
       <td>
-        <form method="post" action="/grants/{{ g.role_name }}/revoke" style="display:inline">
+        {% if g.status in ("active", "revoking") %}
+        <form method="post" action="/grants/{{ g.grant_id }}/revoke" style="display:inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
           <button type="submit">Revoke</button>
         </form>
+        {% endif %}
       </td>
     </tr>
     {% endfor %}

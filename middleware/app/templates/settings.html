@@ -2,54 +2,32 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Connection Settings — Vault DB Access Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connection settings - Vault DB Access</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; color: #222; }
     fieldset { margin-bottom: 1.5rem; border: 1px solid #ccc; border-radius: 6px; }
-    label { display: block; margin: 0.4rem 0; }
-    input { width: 100%; padding: 0.3rem; box-sizing: border-box; }
     button { padding: 0.4rem 0.9rem; cursor: pointer; margin-top: 0.5rem; }
     .message { background: #eef8ee; border: 1px solid #7bc47f; padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; }
     .danger { color: #a33; }
-    nav a { margin-right: 1rem; }
   </style>
 </head>
 <body>
-  <nav><a href="/">← Grants</a></nav>
-  <h1>Connection Settings</h1>
+  <nav><a href="/">&larr; Grants</a></nav>
+  <h1>Connection settings</h1>
   <p>Logged in as <strong>{{ username }}</strong></p>
-
-  {% if message %}
-  <div class="message">{{ message }}</div>
-  {% endif %}
-
+  {% if message %}<div class="message">{{ message }}</div>{% endif %}
+  <p>Vault connects to each database as a non-superuser <code>vault_manager</code> account created by the
+     stack. Connection details are written once by setup and cannot be edited here. You can rotate the
+     manager password: Vault generates a new random one and keeps it, nobody (including this portal) can read it back.</p>
+  {% for db, label in [("postgres", "PostgreSQL"), ("clickhouse", "ClickHouse")] %}
   <fieldset>
-    <legend>PostgreSQL admin connection</legend>
-    <form method="post" action="/settings/postgres">
-      <label>Username <input type="text" name="username" placeholder="postgres" required></label>
-      <label>Password <input type="password" name="password" required></label>
-      <button type="submit">Save</button>
-    </form>
-    <form method="post" action="/settings/postgres/rotate">
-      <button type="submit" class="danger">Rotate root credential now</button>
-    </form>
-    <p><small>After rotation, Vault generates and keeps a new random password itself —
-       nobody, including this admin panel, can read it back. (Vault's scheduled
-       auto-rotation on a cadence is an Enterprise-only capability — Community
-       Edition returns "rotation manager capabilities not supported" if you try it,
-       confirmed while building this. Manual rotation above is unaffected.)</small></p>
-  </fieldset>
-
-  <fieldset>
-    <legend>ClickHouse admin connection</legend>
-    <form method="post" action="/settings/clickhouse">
-      <label>Username <input type="text" name="username" placeholder="vaultadmin" required></label>
-      <label>Password <input type="password" name="password" required></label>
-      <button type="submit">Save</button>
-    </form>
-    <form method="post" action="/settings/clickhouse/rotate">
-      <button type="submit" class="danger">Rotate root credential now</button>
+    <legend>{{ label }}</legend>
+    <form method="post" action="/settings/{{ db }}/rotate">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <button type="submit" class="danger">Rotate manager credential now</button>
     </form>
   </fieldset>
+  {% endfor %}
 </body>
 </html>

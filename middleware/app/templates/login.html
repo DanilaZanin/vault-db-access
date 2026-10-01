@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Vault DB Access Admin — Login</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vault DB Access - Login</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 400px; margin: 4rem auto; padding: 0 1rem; color: #222; }
     label { display: block; margin: 0.75rem 0 0.25rem; }
@@ -13,16 +14,15 @@
   </style>
 </head>
 <body>
-  <h1>Vault DB Access Admin</h1>
-  {% if error %}
-  <div class="error">{{ error }}</div>
-  {% endif %}
+  <h1>Vault DB Access</h1>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="post" action="/login">
-    <label>Vault username <input type="text" name="username" required autofocus></label>
-    <label>Vault password <input type="password" name="password" required></label>
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <label>Username <input type="text" name="username" required autofocus autocomplete="username"></label>
+    <label>Password <input type="password" name="password" required autocomplete="current-password"></label>
     <button type="submit">Log in</button>
   </form>
-  <p class="hint">Log in with your own Vault account (auth/userpass). Only accounts with the
-     <code>db-access-admin</code> Vault policy can issue or manage grants here.</p>
+  <p class="hint">Sign in with your Vault userpass account. Only accounts holding the
+     <code>db-access-admin</code> policy can issue or revoke grants.</p>
 </body>
 </html>

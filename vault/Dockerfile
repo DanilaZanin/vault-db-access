@@ -1,37 +1,30 @@
 FROM golang:1.26-bookworm AS plugin-builder
 
-RUN git clone --depth 1 https://github.com/ContentSquare/vault-plugin-database-clickhouse.git /src
+# Third-party ClickHouse database plugin, pinned to an exact commit (no moving "main").
+ARG CH_PLUGIN_COMMIT=9ca33fa4c4da280c6afeed823c712be247a830f5
+RUN git init /src && cd /src \
+    && git remote add origin https://github.com/ContentSquare/vault-plugin-database-clickhouse.git \
+    && git fetch --depth 1 origin ${CH_PLUGIN_COMMIT} \
+    && git checkout -q FETCH_HEAD
 WORKDIR /src
-# The plugin's own go.mod pins several vulnerable transitive deps (pulled in via the
-# GCP/cloudsqlconn chain): grpc v1.70.0 had CVE-2026-33186 (CRITICAL, HTTP/2 path
-# validation authz bypass); v1.79.3 itself still had GHSA-hrxh-6v49-42gf (xDS RBAC/HTTP2),
-# fixed in 1.82.1, so that's the version actually built here, not the 1.79.3 originally
-# requested. x/net, x/crypto, x/text carried their own HIGH findings (CVE-2026-25681,
-# -33814, -39821 in x/net; -39831/-39832/-39835/-42508/-46595/-46597 in x/crypto/ssh;
-# -56852 in x/text) -- bumped all of them to their fixed releases in the same pass
-# (x/crypto landed on 0.51.0, not the minimum-fixed 0.46.0, because x/net@0.55.0 itself
-# requires >=0.51.0).
-# Confirmed clean (0 findings) with `trivy image --severity HIGH,CRITICAL` after this.
-# Only pin the packages with a direct fix requirement; x/net@0.55.0 pulls in its own
-# minimum-compatible x/crypto and x/sys transitively (both already >= the fixed
-# thresholds for CVE-2026-39824 etc, so no separate pin needed -- go get rejected
-# pinning them lower than what x/net demands).
+# The plugin's own go.mod pins several vulnerable transitive deps (GCP/cloudsqlconn,
+# docker, grpc, x/*). Bump them to current fixed releases and rebuild.
 RUN go get \
-      google.golang.org/grpc@v1.82.1 \
-      golang.org/x/net@v0.55.0 \
-      golang.org/x/crypto@v0.52.0 \
-      golang.org/x/text@v0.39.0 \
+      google.golang.org/grpc@v1.84.0 \
+      golang.org/x/net@v0.59.0 \
+      golang.org/x/crypto@v0.57.0 \
+      golang.org/x/text@v0.42.0 \
       github.com/docker/docker@v28.5.2+incompatible \
     && go mod tidy
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/clickhouse-database-plugin ./cmd/vault-plugin-database-clickhouse
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/clickhouse-database-plugin ./cmd/vault-plugin-database-clickhouse \
+    && sha256sum /out/clickhouse-database-plugin | cut -d' ' -f1 > /out/clickhouse-database-plugin.sha256
 
-FROM hashicorp/vault:2.0.4
+FROM hashicorp/vault:2.1.1
 
-# 2.0.4's base image runs as the non-root `vault` user by default (1.19.0 didn't),
-# so root is needed here to place and chmod the plugin binary; the entrypoint still
-# handles runtime ownership/privilege-drop itself, same as before.
 USER root
-RUN mkdir -p /vault/plugins
-COPY --from=plugin-builder --chown=vault:vault /out/clickhouse-database-plugin /vault/plugins/clickhouse-database-plugin
-RUN chmod +x /vault/plugins/clickhouse-database-plugin
+RUN mkdir -p /vault/plugins /vault/logs && chown vault:vault /vault/plugins /vault/logs
+# Plugin is baked into the image (no shared volume that could shadow it). The sha256 file is
+# read by the setup container (via a compose additional_context) to register the plugin.
+COPY --from=plugin-builder --chown=root:root --chmod=0755 /out/clickhouse-database-plugin /vault/plugins/clickhouse-database-plugin
+COPY --from=plugin-builder --chmod=0644 /out/clickhouse-database-plugin.sha256 /vault/plugins/clickhouse-database-plugin.sha256
 USER vault

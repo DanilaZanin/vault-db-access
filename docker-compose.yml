@@ -1,106 +1,160 @@
+name: vdba
+
 networks:
-  vault-db-access:
+  vdba:
     driver: bridge
 
 volumes:
   vault-data:
-  vault-plugins:
+  vault-logs:      # Vault file audit device; NOT mounted into the middleware
   postgres-data:
   clickhouse-data:
+  middleware-data: # SQLite grant store
+
+x-app-build: &app-build
+  context: .
+  dockerfile: middleware/Dockerfile
+  additional_contexts:
+    vaultimg: "service:vault" # gives the app image the plugin's sha256 (register-by-hash)
+
+x-secret-env: &secret-env
+  POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-}
+  PG_MANAGER_PASSWORD: ${PG_MANAGER_PASSWORD:-}
+  PG_INTROSPECT_PASSWORD: ${PG_INTROSPECT_PASSWORD:-}
+  CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-}
+  CLICKHOUSE_MANAGER_PASSWORD: ${CLICKHOUSE_MANAGER_PASSWORD:-}
+  CLICKHOUSE_INTROSPECT_PASSWORD: ${CLICKHOUSE_INTROSPECT_PASSWORD:-}
+  VDBA_ADMIN_USER: ${VDBA_ADMIN_USER:-}
+  VDBA_ADMIN_PASSWORD: ${VDBA_ADMIN_PASSWORD:-}
 
 services:
-  postgres-test:
-    image: postgres:16
-    container_name: vdba-postgres
+  # Fails (and so blocks everything that depends on it) if any secret is empty or "changeme".
+  preflight:
+    build: *app-build
+    image: vdba-app:local
+    command: ["python", "-m", "app.preflight"]
+    environment: *secret-env
+    restart: "no"
+    networks: [vdba]
+
+  postgres:
+    image: postgres:18.6
     restart: unless-stopped
+    depends_on:
+      preflight: {condition: service_completed_successfully}
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-}
       POSTGRES_DB: appdb
+      VDBA_PG_MANAGER_PASSWORD: ${PG_MANAGER_PASSWORD:-}
+      VDBA_PG_INTROSPECT_PASSWORD: ${PG_INTROSPECT_PASSWORD:-}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./postgres-init/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres-data:/var/lib/postgresql
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
-    networks:
-      - vault-db-access
+      - "127.0.0.1:5432:5432"
+    networks: [vdba]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
 
-  clickhouse-test:
-    image: clickhouse/clickhouse-server:24.8
-    container_name: vdba-clickhouse
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.33
     restart: unless-stopped
+    depends_on:
+      preflight: {condition: service_completed_successfully}
+    environment:
+      CLICKHOUSE_USER: bootstrap_admin
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-}
+      CLICKHOUSE_DB: appdb
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      VDBA_CH_MANAGER_PASSWORD: ${CLICKHOUSE_MANAGER_PASSWORD:-}
+      VDBA_CH_INTROSPECT_PASSWORD: ${CLICKHOUSE_INTROSPECT_PASSWORD:-}
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./clickhouse-init/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      - ./clickhouse-init/vaultadmin.xml:/etc/clickhouse-server/users.d/vaultadmin.xml:ro
+      - ./clickhouse-init:/docker-entrypoint-initdb.d:ro
     ports:
-      - "8123:8123"
-      - "9000:9000"
-    networks:
-      - vault-db-access
+      - "127.0.0.1:8123:8123"
+    networks: [vdba]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
 
   vault:
     build:
       context: ./vault
-    container_name: vdba-vault
+    image: vdba-vault:local
     restart: unless-stopped
+    depends_on:
+      preflight: {condition: service_completed_successfully}
     environment:
       VAULT_ADDR: http://127.0.0.1:8200
-      # Dev/test default: plain HTTP on the internal docker network. For production,
-      # override this to enable TLS -- e.g.:
-      #   {"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":false,
-      #     "tls_cert_file":"/vault/tls/cert.pem","tls_key_file":"/vault/tls/key.pem"}},
-      #    "api_addr":"https://vault.example.com:8200"}
-      # and mount your cert/key into /vault/tls.
+      # Plain HTTP on the internal docker network and 127.0.0.1 only (demo). For anything else put
+      # TLS on the listener (see README "Production").
       VAULT_LOCAL_CONFIG: >-
-        {"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"api_addr":"http://0.0.0.0:8200"}
+        {"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"api_addr":"http://vault:8200"}
     volumes:
       - vault-data:/vault/file
-      - vault-plugins:/vault/plugins
+      - vault-logs:/vault/logs
       - ./vault/config.hcl:/vault/config/config.hcl:ro
     command: ["server"]
     ports:
-      - "8200:8200"
-    networks:
-      - vault-db-access
+      - "127.0.0.1:8200:8200"
+    networks: [vdba]
+    healthcheck:
+      # healthy as soon as the API answers, sealed or not; setup does the unseal.
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:8200/v1/sys/health?sealedcode=200&uninitcode=200' >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # One-off bootstrap (compose profile "setup"): init/unseal Vault, write keys to ./secrets,
+  # enable audit, provision engines/policies/AppRole, hand the AppRole secret to the middleware
+  # through ./secrets/approle, then revoke the root token. Not part of the running stack.
+  setup:
+    profiles: [setup]
+    build: *app-build
+    image: vdba-app:local
+    user: root
+    command: ["python", "-m", "app.setup"]
+    depends_on:
+      vault: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+    environment:
+      <<: *secret-env
+      VAULT_ADDR: http://vault:8200
+      VDBA_SETUP_ARGS: ${VDBA_SETUP_ARGS:-}
+    volumes:
+      - ./secrets:/secrets
+    networks: [vdba]
 
   middleware:
-    build:
-      context: ./middleware
-    container_name: vdba-middleware
+    build: *app-build
+    image: vdba-app:local
     restart: unless-stopped
-    environment:
-      VAULT_ADDR: http://vdba-vault:8200
-      SESSION_SECRET_KEY: ${SESSION_SECRET_KEY}
-      POSTGRES_HOST: vdba-postgres
-      POSTGRES_PORT: "5432"
-      CLICKHOUSE_HOST: vdba-clickhouse
-      CLICKHOUSE_PORT: "9000"
-      CLICKHOUSE_HTTP_PORT: "8123"
-      # POSTGRES_SUPERUSER_PASSWORD / CLICKHOUSE_VAULTADMIN_PASSWORD are only read by
-      # `python -m app.first_time_setup` (one-off), never by the running app. Pass them
-      # on the `docker compose run` command for that step, not here, once you're past
-      # initial bring-up (see README.md).
-      POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-}
-      CLICKHOUSE_VAULTADMIN_PASSWORD: ${CLICKHOUSE_VAULTADMIN_PASSWORD:-}
-    volumes:
-      - ./secrets:/vault-secrets
-      - vault-plugins:/vault-plugins:ro
     depends_on:
-      - vault
-      - postgres-test
-      - clickhouse-test
+      preflight: {condition: service_completed_successfully}
+      vault: {condition: service_healthy}
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VDBA_POSTGRES_HOST: postgres
+      VDBA_CLICKHOUSE_HOST: clickhouse
+      VDBA_DB_PATH: /data/vdba.sqlite3
+      VDBA_APPROLE_DIR: /run/vdba/approle
+      VDBA_TTL_MIN_SECONDS: ${VDBA_TTL_MIN_SECONDS:-10}
+      VDBA_TTL_MAX_SECONDS: ${VDBA_TTL_MAX_SECONDS:-86400}
+      VDBA_RECONCILE_INTERVAL: ${VDBA_RECONCILE_INTERVAL:-60}
+      VDBA_TEST_HOOKS: ${VDBA_TEST_HOOKS:-0}
+    volumes:
+      - middleware-data:/data
+      - ./secrets/approle:/run/vdba/approle:ro   # ONLY this directory, never ./secrets itself
     ports:
-      - "8000:8000"
-    networks:
-      - vault-db-access
+      - "127.0.0.1:8000:8000"
+    networks: [vdba]
