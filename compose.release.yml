@@ -1,11 +1,10 @@
-# Run the published, signed images instead of building locally:
-#   docker compose -f docker-compose.yml -f compose.release.yml up -d ...   (or: make up-release)
-# VDBA_VERSION selects the tag (default: latest). Verify a signature with:
-#   cosign verify ghcr.io/danilazanin/vault-db-access-middleware:v0.1.0 \
-#     --certificate-identity-regexp 'https://github.com/DanilaZanin/vault-db-access/' \
-#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# Run the published, signed images instead of building locally (see README "Published images"):
+#   VDBA_VERSION=v0.1.0 VDBA_MIDDLEWARE_DIGEST=sha256:... VDBA_VAULT_DIGEST=sha256:... \
+#     docker compose -f docker-compose.yml -f compose.release.yml up -d ...      (or: make up-release)
+# With the *_DIGEST variables set, compose runs EXACTLY those digests (the ones you verified with cosign);
+# without them it follows the tag (VDBA_VERSION, default latest).
 x-middleware-image: &mw
-  image: ghcr.io/danilazanin/vault-db-access-middleware:${VDBA_VERSION:-latest}
+  image: ghcr.io/danilazanin/vault-db-access-middleware:${VDBA_VERSION:-latest}${VDBA_MIDDLEWARE_DIGEST:+@}${VDBA_MIDDLEWARE_DIGEST:-}
   build: !reset null
   pull_policy: always
 
@@ -14,6 +13,6 @@ services:
   setup: *mw
   middleware: *mw
   vault:
-    image: ghcr.io/danilazanin/vault-db-access-vault:${VDBA_VERSION:-latest}
+    image: ghcr.io/danilazanin/vault-db-access-vault:${VDBA_VERSION:-latest}${VDBA_VAULT_DIGEST:+@}${VDBA_VAULT_DIGEST:-}
     build: !reset null
     pull_policy: always

@@ -22,6 +22,22 @@ def _ok(names: list[str]) -> list[str]:
     return [n for n in names if IDENTIFIER_RE.fullmatch(n)]
 
 
+def pg_ssl_kwargs() -> dict[str, str]:
+    kw = {"sslmode": config.PG_SSLMODE}
+    if config.PG_SSLROOTCERT:
+        kw["sslrootcert"] = config.PG_SSLROOTCERT
+    return kw
+
+
+def ch_ssl_kwargs() -> dict:
+    kw: dict = {"secure": config.CH_SECURE}
+    if config.CH_SECURE:
+        kw["verify"] = True
+        if config.CH_CA_CERT:
+            kw["ca_cert"] = config.CH_CA_CERT
+    return kw
+
+
 def _pg_connect() -> psycopg.Connection:
     user, password = vault_client.introspect_credentials(DbType.postgres)
     return psycopg.connect(

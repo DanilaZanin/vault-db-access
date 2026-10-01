@@ -35,4 +35,56 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO vault_manager WITH GRANT OPTION;
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
     GRANT ALL ON SEQUENCES TO vault_manager WITH GRANT OPTION;
+
+-- Maintenance functions owned by vault_manager (run as the caller, i.e. as vault_manager, so they can only touch
+-- what it may touch). They are the ONLY revocation SQL Vault runs, and they are idempotent: a role that is already
+-- gone is a no-op, so a retried or late Vault revocation (including expiry with the web app stopped) cannot get
+-- stuck on "role does not exist". Vault splits statements on semicolons, hence one SELECT per call.
+CREATE SCHEMA vdba AUTHORIZATION vault_manager;
+REVOKE ALL ON SCHEMA vdba FROM PUBLIC;
+SET ROLE vault_manager;
+
+CREATE FUNCTION vdba.lockout_role(rolename text) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
+BEGIN
+    IF rolename !~ '^vdba_[0-9a-f]{10}_[a-z0-9]{6}$' THEN
+        RAISE EXCEPTION 'refusing to touch role %', rolename;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = rolename) THEN
+        EXECUTE format('ALTER ROLE %I NOLOGIN', rolename);
+        EXECUTE format('ALTER ROLE %I VALID UNTIL %L', rolename, '1970-01-01 00:00:00+00');
+    END IF;
+END
+$fn$;
+
+CREATE FUNCTION vdba.cleanup_role(rolename text) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+    n integer;
+    tries integer := 0;
+BEGIN
+    IF rolename !~ '^vdba_[0-9a-f]{10}_[a-z0-9]{6}$' THEN
+        RAISE EXCEPTION 'refusing to touch role %', rolename;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = rolename) THEN
+        RETURN;
+    END IF;
+    PERFORM set_config('lock_timeout', '5s', true);
+    PERFORM vdba.lockout_role(rolename);
+    LOOP
+        PERFORM pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = rolename;
+        PERFORM pg_stat_clear_snapshot();
+        SELECT count(*) INTO n FROM pg_stat_activity WHERE usename = rolename;
+        EXIT WHEN n = 0;
+        tries := tries + 1;
+        IF tries > 50 THEN
+            RAISE EXCEPTION 'backends of % still alive after % attempts', rolename, tries;
+        END IF;
+        PERFORM pg_sleep(0.2);
+    END LOOP;
+    EXECUTE format('DROP OWNED BY %I', rolename);
+    EXECUTE format('DROP ROLE IF EXISTS %I', rolename);
+END
+$fn$;
+RESET ROLE;
 SQL

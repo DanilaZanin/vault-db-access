@@ -116,16 +116,33 @@ def create_grant_token(ttl: int, label: str) -> tuple[str, str]:
     return resp["auth"]["client_token"], resp["auth"]["accessor"]
 
 
+MAX_ACCESSOR_SCAN = 20000
+
+
+def _gone(exc: Exception) -> bool:
+    return isinstance(exc, (vexc.InvalidRequest, vexc.InvalidPath)) and "invalid accessor" in str(exc).lower()
+
+
 def find_token_accessors(label: str) -> list[str]:
-    """Accessors of live tokens whose display name is `label` (recovery path only; O(live tokens))."""
+    """Accessors of live tokens created for `label` (recovery path only; O(live tokens)).
+
+    Vault stores the display name as "token-<name>" with "_" rewritten to "-". A lookup that fails for any
+    reason other than "that token is already gone" raises, and so does a listing too long to scan: the caller
+    must then NOT consider the cleanup complete."""
     resp = service.call(lambda c: c.list("auth/token/accessors"))
+    keys = (resp or {}).get("data", {}).get("keys", [])
+    if len(keys) > MAX_ACCESSOR_SCAN:
+        raise RuntimeError(f"{len(keys)} tokens: too many to scan, cannot confirm the grant token is gone")
+    wanted = "token-" + label.replace("_", "-")
     found = []
-    for acc in (resp or {}).get("data", {}).get("keys", [])[:20000]:
+    for acc in keys:
         try:
             info = service.call(lambda c, a=acc: c.write("auth/token/lookup-accessor", accessor=a))
-        except vexc.VaultError:
-            continue  # expired/revoked between list and lookup
-        if info["data"].get("display_name") in (f"token-{label}", label):
+        except Exception as exc:
+            if _gone(exc):
+                continue  # expired or revoked between list and lookup
+            raise
+        if info["data"].get("display_name") in (wanted, "token-" + label, label):
             found.append(acc)
     return found
 

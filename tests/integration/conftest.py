@@ -37,6 +37,30 @@ REQUIRE_STACK = os.environ.get("VDBA_REQUIRE_STACK") == "1"
 _skipped_for_stack = False
 
 
+def need(msg: str):
+    """Missing precondition: a hard failure in the security gate (VDBA_REQUIRE_STACK=1), a skip otherwise."""
+    if REQUIRE_STACK:
+        pytest.fail(msg, pytrace=False)
+    pytest.skip(msg)
+
+
+def token_info(admin_token: str, accessor: str) -> dict | None:
+    """lookup-accessor with the test-admin token; None if the token no longer exists."""
+    r = requests.post(
+        f"{VAULT}/v1/auth/token/lookup-accessor",
+        headers={"X-Vault-Token": admin_token},
+        json={"accessor": accessor},
+        timeout=15,
+    )
+    return r.json()["data"] if r.status_code == 200 else None
+
+
+def all_tokens(admin_token: str) -> list[dict]:
+    r = requests.request("LIST", f"{VAULT}/v1/auth/token/accessors", headers={"X-Vault-Token": admin_token}, timeout=30)
+    keys = r.json()["data"]["keys"] if r.status_code == 200 else []
+    return [d for a in keys if (d := token_info(admin_token, a))]
+
+
 def dc(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(  # noqa: S603
         ["docker", "compose", *args],

@@ -6,29 +6,60 @@ on:
 
 permissions: {}
 
+# One release at a time; a second tag waits instead of racing the first one's tag promotion.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  VAULT_IMAGE: ghcr.io/danilazanin/vault-db-access-vault
+  APP_IMAGE: ghcr.io/danilazanin/vault-db-access-middleware
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: meta
+        name: tag must be vX.Y.Z[-pre] and have a CHANGELOG section
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad tag $TAG" >&2; exit 1; }
+          grep -qE "^## ${TAG}\$" CHANGELOG.md || { echo "no '## ${TAG}' section in CHANGELOG.md" >&2; exit 1; }
+          if [[ "$TAG" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
   ci:
+    needs: prepare
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
   publish:
-    needs: ci
+    needs: [prepare, ci]
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write # push to ghcr.io
       id-token: write # cosign keyless signing (OIDC)
-    env:
-      REGISTRY: ghcr.io
-      VAULT_IMAGE: ghcr.io/danilazanin/vault-db-access-vault
-      APP_IMAGE: ghcr.io/danilazanin/vault-db-access-middleware
+    outputs:
+      vault_digest: ${{ steps.vault.outputs.digest }}
+      app_digest: ${{ steps.app.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -37,33 +68,18 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # The vault image goes first: the middleware image bakes in the sha256 of the plugin binary for each
-      # architecture, taken from the vault image of the same platform (build context `vaultimg`).
-      - id: vault_meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.VAULT_IMAGE }}
-          tags: |
-            type=semver,pattern=v{{version}}
-            type=raw,value=latest
+      # Only the immutable version tag is pushed here. `latest` is promoted at the very end, after scan, sign
+      # and verify have succeeded for BOTH images (and never for prerelease tags).
+      # The vault image goes first: the middleware image bakes in the plugin sha256 of the same platform.
       - id: vault
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./vault
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.vault_meta.outputs.tags }}
-          labels: ${{ steps.vault_meta.outputs.labels }}
+          tags: ${{ env.VAULT_IMAGE }}:${{ github.ref_name }}
           sbom: true
           provenance: mode=max
-
-      - id: app_meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.APP_IMAGE }}
-          tags: |
-            type=semver,pattern=v{{version}}
-            type=raw,value=latest
       - id: app
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -72,21 +88,62 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-contexts: vaultimg=docker-image://${{ env.VAULT_IMAGE }}@${{ steps.vault.outputs.digest }}
           push: true
-          tags: ${{ steps.app_meta.outputs.tags }}
-          labels: ${{ steps.app_meta.outputs.labels }}
+          tags: ${{ env.APP_IMAGE }}:${{ github.ref_name }}
           sbom: true
           provenance: mode=max
 
-      - name: cosign sign (keyless)
+      - name: scan the PUBLISHED per-platform images (full report incl. unfixed; gate on fixable HIGH/CRITICAL)
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          VAULT_DIGEST: ${{ steps.vault.outputs.digest }}
+          APP_DIGEST: ${{ steps.app.outputs.digest }}
+        run: |
+          mkdir -p reports
+          for entry in "vault|${VAULT_IMAGE}|${VAULT_DIGEST}" "middleware|${APP_IMAGE}|${APP_DIGEST}"; do
+            IFS='|' read -r name image digest <<< "$entry"
+            docker buildx imagetools inspect "${image}@${digest}" --format '{{json .Manifest}}' \
+              | jq -r '.manifests[] | select(.platform.os=="linux" and .platform.architecture!="unknown") | "\(.platform.architecture) \(.digest)"' \
+              | while read -r arch pdigest; do
+                  echo "scanning ${name} ${arch} ${pdigest}"
+                  # full report, unfixed findings included, attached to the release
+                  docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/reports:/reports" "$TRIVY_IMAGE" \
+                    image --quiet --format json --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                    --output "/reports/trivy-${name}-${arch}.json" "${image}@${pdigest}"
+                  # gate: HIGH/CRITICAL that have a fix
+                  docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD "$TRIVY_IMAGE" \
+                    image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${image}@${pdigest}"
+                done
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-reports
+          path: reports/
+          if-no-files-found: error
+
+      - name: cosign sign (keyless) and verify with the exact workflow identity
+        env:
+          VAULT_DIGEST: ${{ steps.vault.outputs.digest }}
+          APP_DIGEST: ${{ steps.app.outputs.digest }}
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          for ref in "${VAULT_IMAGE}@${VAULT_DIGEST}" "${APP_IMAGE}@${APP_DIGEST}"; do
+            cosign sign --yes "$ref"
+            cosign verify "$ref" --certificate-identity "$IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          done
+
+      - name: promote latest (stable tags only)
+        if: needs.prepare.outputs.prerelease == 'false'
         env:
           VAULT_DIGEST: ${{ steps.vault.outputs.digest }}
           APP_DIGEST: ${{ steps.app.outputs.digest }}
         run: |
-          cosign sign --yes "${VAULT_IMAGE}@${VAULT_DIGEST}"
-          cosign sign --yes "${APP_IMAGE}@${APP_DIGEST}"
+          docker buildx imagetools create -t "${VAULT_IMAGE}:latest" "${VAULT_IMAGE}@${VAULT_DIGEST}"
+          docker buildx imagetools create -t "${APP_IMAGE}:latest" "${APP_IMAGE}@${APP_DIGEST}"
 
   github-release:
-    needs: publish
+    needs: [prepare, publish]
     runs-on: ubuntu-24.04
     permissions:
       contents: write # create the GitHub release
@@ -94,17 +151,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: notes from CHANGELOG
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: trivy-reports
+          path: reports
+      - name: notes from CHANGELOG plus the verified digests
         env:
           TAG: ${{ github.ref_name }}
+          VAULT_DIGEST: ${{ needs.publish.outputs.vault_digest }}
+          APP_DIGEST: ${{ needs.publish.outputs.app_digest }}
         run: |
-          awk -v ver="${TAG#v}" '
-            $0 ~ "^## v?"ver"$" {on=1; next}
-            on && /^## / {exit}
-            on {print}' CHANGELOG.md > notes.md
+          awk -v hdr="## ${TAG}" '$0 == hdr {on=1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md
           test -s notes.md || { echo "no CHANGELOG section for ${TAG}" >&2; exit 1; }
+          {
+            echo
+            echo "### Image digests (signed with cosign keyless, verified by the release workflow)"
+            echo "- ${VAULT_IMAGE}@${VAULT_DIGEST}"
+            echo "- ${APP_IMAGE}@${APP_DIGEST}"
+            echo
+            echo "Full Trivy reports (including findings that have no fix yet) are attached per image and platform."
+          } >> notes.md
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --verify-tag
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          flags=()
+          [[ "$PRERELEASE" == "true" ]] && flags+=(--prerelease)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --verify-tag \
+            "${flags[@]}" reports/*.json

@@ -25,6 +25,11 @@ First hardened release. It is a rewrite of the security model and **not compatib
   byte-counted body limit, admission limits, private SQLite files, Vault file audit device.
 - Dependencies updated (pip-audit clean); images pinned by digest; ClickHouse plugin pinned to a commit.
 
+- Hardening found in the final reviews: setup probes the connectors' effective privileges (role memberships, extra
+  grants) and username template; PostgreSQL revocation is one idempotent, time-bounded function call; ClickHouse
+  revocation kills running queries; service tokens are revoked on re-login; lost grant tokens are found by name;
+  TLS settings reach the introspection connections; `latest` is only promoted after scan, sign and verify.
+
 ### Added
 - `SECURITY.md` (threat model and residual risks), `LICENSE` (Apache-2.0), CI (ruff, unit, pip-audit, hadolint,
   actionlint, Trivy, full integration suite on a real compose stack), signed multi-arch images on GHCR.

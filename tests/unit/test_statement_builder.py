@@ -20,14 +20,12 @@ def test_postgres_table_scoped_select_only():
     joined = " ".join(creation)
     assert "orders" not in joined and "products" not in joined
     assert not any("SEQUENCE" in s for s in creation)  # SELECT does not need sequences
-    assert 'DROP ROLE IF EXISTS "{{name}}";' in revocation
+    assert revocation == ["SELECT vdba.cleanup_role('{{name}}');"]
 
 
-def test_postgres_revocation_locks_out_before_dropping():
+def test_postgres_revocation_is_one_idempotent_function_call():
     _, revocation = pg(Scope.tables, ["customers"], ["SELECT"])
-    assert revocation.index('ALTER ROLE "{{name}}" NOLOGIN;') < 3
-    assert "pg_terminate_backend" in revocation[3]
-    assert revocation.index('DROP OWNED BY "{{name}}";') < revocation.index('DROP ROLE IF EXISTS "{{name}}";')
+    assert revocation == ["SELECT vdba.cleanup_role('{{name}}');"]
 
 
 def test_postgres_insert_grants_only_owned_sequences():
@@ -81,7 +79,7 @@ def test_clickhouse_table_scoped():
     creation, revocation = ch(Scope.tables, ["orders"], ["SELECT"])
     assert "GRANT SELECT ON `appdb`.`orders` TO '{{name}}';" in creation
     assert not any("customers" in s for s in creation)
-    assert revocation == ["DROP USER IF EXISTS '{{name}}';"]
+    assert revocation == ["KILL QUERY WHERE user = '{{name}}' SYNC;", "DROP USER IF EXISTS '{{name}}';"]
 
 
 def test_clickhouse_user_expires_with_the_lease():
@@ -89,20 +87,17 @@ def test_clickhouse_user_expires_with_the_lease():
     assert "VALID UNTIL '{{expiration}}'" in creation[0]
 
 
-def test_postgres_vault_side_revocation_is_time_bounded():
-    _, revocation = pg(Scope.tables, ["customers"], ["SELECT"])
-    assert revocation[0].startswith("SET LOCAL lock_timeout") and revocation[1].startswith(
-        "SET LOCAL statement_timeout"
-    )
-
-
 def test_maintenance_statements_only_accept_our_account_names():
     from app.statement_builder import drop_statements, lockout_statements, terminate_statements
 
     good = "vdba_0123456789_abc123"
-    assert 'ALTER ROLE "vdba_0123456789_abc123" NOLOGIN;' in lockout_statements(DbType.postgres, good)
+    assert lockout_statements(DbType.postgres, good) == ["SELECT vdba.lockout_role('vdba_0123456789_abc123');"]
+    assert drop_statements(DbType.postgres, good) == ["SELECT vdba.cleanup_role('vdba_0123456789_abc123');"]
     assert "usename = 'vdba_0123456789_abc123'" in terminate_statements(DbType.postgres, good)[0]
-    assert drop_statements(DbType.clickhouse, good) == ["DROP USER IF EXISTS 'vdba_0123456789_abc123';"]
+    assert drop_statements(DbType.clickhouse, good) == [
+        "KILL QUERY WHERE user = 'vdba_0123456789_abc123' SYNC;",
+        "DROP USER IF EXISTS 'vdba_0123456789_abc123';",
+    ]
     for bad in ("postgres", "vault_manager", good + "'; DROP", good.upper(), "vdba_0123456789_abc123\n", ""):
         for fn in (lockout_statements, terminate_statements, drop_statements):
             with pytest.raises(ValueError):

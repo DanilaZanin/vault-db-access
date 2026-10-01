@@ -3,7 +3,9 @@
 vault-db-access is a small web portal and API that issues temporary PostgreSQL and ClickHouse accounts on top of
 HashiCorp Vault's database secrets engine. An administrator picks a database, tables, commands and a TTL. Vault
 creates the database account, the portal shows the password once, and Vault revokes the account when the TTL ends
-or when an administrator revokes it. The portal never stores credentials.
+or when an administrator revokes it. The portal does not store the issued database passwords or the per-grant
+Vault tokens. It does store the admin's own rights-less Vault login token (session table) and holds the service
+identity's AppRole SecretID as a file; see [SECURITY.md](SECURITY.md).
 
 It is meant for small teams that want short-lived, table-scoped database access (on-call, support, one-off
 analysis) without handing out shared passwords. It needs only Vault OSS / Community Edition: no Enterprise
@@ -14,8 +16,8 @@ Status: v0.1, single node, demo-grade deployment files. Read [SECURITY.md](SECUR
 ## 60-second demo
 
 Needs Docker with compose v2, `make`, `openssl` and [uv](https://docs.astral.sh/uv/) (only for the tests).
-`make up` takes about 3 minutes (167 s measured with the image layers cached; the first run also pulls and builds
-images) and the four containers use about 380 MB of RAM together.
+`make up` takes about 17 s when the images are already built and cached (measured), and about 3 minutes on the first
+run, which pulls and builds the images. The four containers use about 380 MB of RAM together.
 
 ```
 git clone https://github.com/DanilaZanin/vault-db-access && cd vault-db-access
@@ -28,11 +30,14 @@ one-off setup (initialises and unseals Vault, provisions it, revokes the root to
 
 ```
 [setup] Vault initialized; unseal key(s) and root token written to /secrets/vault-keys.json (mode 0600)
+[setup] Vault unsealed
 [setup] file audit device enabled (/vault/logs/audit.log in the vault container)
-[setup] connection 'postgres' verified: account vault_manager, no superuser-like rights
-[setup] connection 'clickhouse' verified: account vault_manager, no superuser-like rights
+[setup] connection 'postgres' verified: account vault_manager, our username template, privileges within the allowlist
+[setup] connection 'clickhouse' verified: account vault_manager, our username template, privileges within the allowlist
+[setup] new AppRole secret_id written to secrets/approle/secret_id
 [setup] self-check ok: AppRole login works; policy/config writes are forbidden
 [setup] root token revoked and removed from disk
+[setup] done: portal admin is 'admin'; the middleware can now log in via AppRole
 portal: http://127.0.0.1:8000  (admin user/password: see VDBA_ADMIN_* in .env)
 ```
 
@@ -81,13 +86,24 @@ ERROR:  permission denied for table customers
 After `POST /api/grants/vdba_91431696f3/revoke` (an admin clicking "Revoke" does the same) the account is gone:
 
 ```
-200 revoked
+200
+{"grant_id": "vdba_91431696f3", "db_type": "postgres", "scope": "tables", "tables": ["customers"],
+ "commands": ["SELECT"], "requested_for": "alice", "issued_by": "admin", "ttl_seconds": 600,
+ "status": "revoked", "username": "vdba_91431696f3_ohsthz",
+ "created_at": "2026-10-01T08:27:16Z", "expires_at": "2026-10-01T08:37:16Z"}
 ... -c "SELECT id, name FROM customers"
 psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  role "vdba_91431696f3_ohsthz" does not exist
 ```
 
-API clients must send `Origin: http://127.0.0.1:8000` and an `X-CSRF-Token` taken from `GET /api/session` on every
-POST. Reset everything with `make down` (it deletes the volumes and `./secrets`).
+Logging in from a script (this is what the integration tests do; every step below was run against the demo):
+
+1. `GET /login`: the response sets the `vdba_pre` cookie and the HTML form contains `<input name="csrf_token" value="...">`.
+2. `POST /login` as a form with `csrf_token`, `username`, `password`, the `vdba_pre` cookie and the header
+   `Origin: http://127.0.0.1:8000`. Success is a 303 that sets the `vdba_sid` session cookie.
+3. `GET /api/session` returns `{"username": ..., "csrf_token": ...}`.
+4. Every later POST needs the header `Origin: http://127.0.0.1:8000` and `X-CSRF-Token: <that token>`.
+
+Reset everything with `make down` (it deletes the volumes and `./secrets`).
 
 ## How it works
 
@@ -110,7 +126,11 @@ POST. Reset everything with `make down` (it deletes the volumes and `./secrets`)
             with the one-time password            +-----------------------+
 ```
 
-- The portal talks to Vault only as its own AppRole identity. Admins hold a marker policy and no Vault rights.
+- Two different identities. An admin logs in with a Vault userpass account that holds only a marker policy and
+  can do nothing in Vault. The portal itself uses an AppRole identity that may write database roles named
+  `vdba_*` (SQL from fixed templates), create per-grant tokens, revoke leases and tokens, run the maintenance
+  SQL through one-shot roles and read the introspection secrets. It cannot write policies or connections or
+  read credentials.
 - Vault connects to each database as `vault_manager`, a non-superuser (details of its grants are in
   `postgres-init/02-roles.sh` and `clickhouse-init/02-roles.sh`). Role creation SQL is generated by the portal from
   fixed templates and validated identifiers.
@@ -138,11 +158,18 @@ without the portal: Vault revokes the lease by itself and PostgreSQL's `VALID UN
 
 Full threat model and residual risks: [SECURITY.md](SECURITY.md). Summary:
 
-- An admin cannot write Vault policies, roles or connections, and the portal's service identity cannot either.
-  The root token is revoked at the end of setup. The middleware container mounts only the AppRole files.
-- A recipient gets only the listed tables (and sequences owned by them), no DDL, for the TTL, and a revoked
-  account is locked out and its sessions terminated. Passwords are shown once, sent with `Cache-Control: no-store`,
-  and never stored or logged.
+- An admin cannot write Vault policies, roles or connections; the portal's service identity cannot write
+  policies or connections (it does write `vdba_*` database roles). The root token is revoked at the end of setup.
+  The middleware container mounts only the AppRole files.
+- Setup refuses a database connector whose account is not `vault_manager`, whose username template is foreign, or
+  whose effective privileges exceed an allowlist (superuser-like attributes, predefined or foreign role
+  memberships on PostgreSQL; extra grants or roles on ClickHouse). It cannot prove that the service identity is
+  unable to do harm through the roles it writes: on ClickHouse that includes `ALTER USER` on any SQL-managed user.
+- A recipient gets the listed tables (and the sequences owned by them) and no DDL, for the TTL. On revoke through
+  the portal a PostgreSQL account is locked out, its sessions are terminated and confirmed gone in
+  `pg_stat_activity`, then dropped; a ClickHouse account has its running queries killed and is dropped. Expiry
+  without the portal is Vault's own best-effort revocation of the same effect, without the confirmation step.
+- Passwords are shown once, sent with `Cache-Control: no-store`, and never stored or logged.
 - Sessions are server-side and re-validated against the current Vault user. State-changing requests need a CSRF
   token and a matching `Origin`. Request bodies are limited to 64 KiB. Vault's file audit device is on.
 
@@ -167,34 +194,59 @@ Residual risks you must know about:
   before setup, and remove `VDBA_ALLOW_INSECURE`. Setup refuses to run without either a TLS setting or the explicit
   insecure flag. ClickHouse transport is not configured by this repo: use a secure port and TLS on your server.
 - Use a dedicated ClickHouse instance. Remove or lock down `bootstrap_admin` and do not publish its port.
-- Back up the `/data` volume. Consistent copy of the SQLite file, then fetch it (it holds hashed session ids and
-  admin login tokens, so protect it):
+- Back up the `/data` volume. The SQLite file contains the admins' Vault login tokens (8 h, marker policy only) and
+  hashed session ids, so store the copy like a secret and keep it OUT of the repository directory:
   ```
   docker compose exec -T middleware python -c "import sqlite3;s=sqlite3.connect('/data/vdba.sqlite3');d=sqlite3.connect('/tmp/backup.sqlite3');s.backup(d)"
-  docker compose cp middleware:/tmp/backup.sqlite3 ./backup.sqlite3
+  docker compose cp middleware:/tmp/backup.sqlite3 ~/vdba-backup/vdba.sqlite3    # any directory outside the clone
+  docker compose exec -T middleware rm /tmp/backup.sqlite3
   ```
   Also back up the Vault data volume and `./secrets/vault-keys.json` (the unseal key) separately.
 - After a Vault restart it is sealed again: `make setup` unseals it from `./secrets/vault-keys.json` and changes
   nothing else.
-- Re-running setup after the root token was revoked: setup then only unseals and checks the AppRole login. To change
-  policies or connections you need a privileged Vault token again. In my test on Vault 2.1.1,
-  `vault operator generate-root -init` answered `permission denied` without a token, so do not rely on it. Either
-  run setup with `SETUP_ARGS=--keep-root` (the root token then stays in `./secrets/vault-keys.json`, store it
-  offline), or keep a break-glass admin policy of your own in Vault. For the demo, `make down && make up` starts over
-  (this deletes all data).
+- Re-running setup after the root token was revoked: setup then only unseals, checks the AppRole login and re-checks
+  the connector account and username template with the service identity. It prints a warning that the privilege
+  probe was not re-run. To change policies or connections, or to re-run the probe, you need a root token again.
+  Vault 2.1.1 only allows `generate-root` unauthenticated when the server config says so. The procedure (run on the
+  Docker host, every command was run against the demo stack):
+  ```
+  printf '\nenable_unauthenticated_access = ["generate-root"]\n' >> vault/config.hcl
+  docker compose restart vault && make setup                       # setup unseals it again
+  V() { docker compose exec -T -e VAULT_ADDR=http://127.0.0.1:8200 vault vault "$@"; }
+  INIT=$(V operator generate-root -init -format=json)
+  NONCE=$(echo "$INIT" | python3 -c "import sys,json;print(json.load(sys.stdin)['nonce'])")
+  OTP=$(echo "$INIT" | python3 -c "import sys,json;print(json.load(sys.stdin)['otp'])")
+  KEY=$(python3 -c "import json;print(json.load(open('secrets/vault-keys.json'))['keys'][0])")
+  ENC=$(echo "$KEY" | V operator generate-root -nonce=$NONCE -format=json - | python3 -c "import sys,json;print(json.load(sys.stdin)['encoded_token'])")
+  V operator generate-root -decode=$ENC -otp=$OTP > secrets/root-token && chmod 600 secrets/root-token
+  # remove the enable_unauthenticated_access line from vault/config.hcl again, then:
+  docker compose restart vault && make setup                       # unseals, re-provisions, revokes the new root
+  ```
+  With more than one unseal key, repeat the `-nonce` step with each key until the response contains
+  `"complete": true`. Alternatively run setup with `SETUP_ARGS=--keep-root` (the root token then stays in
+  `./secrets/vault-keys.json`, store it offline). For the demo, `make down && make up` starts over and deletes all data.
 - Upgrading from the layout before v0.1: breaking changes are listed in [CHANGELOG.md](CHANGELOG.md): `grants.json`
   became SQLite (old grants are not migrated, revoke them first), `vaultadmin.xml` is gone, token delivery and
   `allow_create` are removed, setup is the new one-off service, connectors are non-superuser, `.env` changed, ports
   are loopback-only, API clients need `Origin` and CSRF.
-- Published images (after the first `v*` tag is released) are built for amd64 and arm64, with SBOM and provenance,
-  and signed with cosign keyless:
+- Published images (available after the first `v*` tag is released) are built for amd64 and arm64 with SBOM and
+  provenance attestations. The release workflow scans every platform digest with Trivy before it promotes `latest`
+  (stable tags only), signs both images with cosign keyless and verifies the signatures against the exact workflow
+  identity. The GitHub release lists both digests and attaches the full Trivy reports. GHCR packages are private
+  until the owner sets them public (package settings); anonymous pulls and `make up-release` need that.
+  Verify BOTH images, then run exactly the digests you verified:
   ```
-  cosign verify ghcr.io/danilazanin/vault-db-access-middleware:v0.1.0 \
-    --certificate-identity-regexp 'https://github.com/DanilaZanin/vault-db-access/' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
-  make up-release VDBA_VERSION=v0.1.0   # = docker compose -f docker-compose.yml -f compose.release.yml ...
+  V=v0.1.0
+  ID="https://github.com/DanilaZanin/vault-db-access/.github/workflows/release.yml@refs/tags/$V"
+  for img in vault-db-access-middleware vault-db-access-vault; do
+    cosign verify ghcr.io/danilazanin/$img:$V --certificate-identity "$ID" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  done
+  # use the digests printed by cosign (or listed in the release notes):
+  VDBA_VERSION=$V VDBA_MIDDLEWARE_DIGEST=sha256:... VDBA_VAULT_DIGEST=sha256:... make up-release
   ```
-  I could not run the two commands above before a release exists.
+  `make up-release` is `docker compose -f docker-compose.yml -f compose.release.yml ...`. I could not run these
+  commands before a release exists.
 
 ## What it does not do yet (ideas for v0.2)
 
@@ -218,8 +270,10 @@ make down     # destroy stack, volumes and ./secrets
 
 Layout: `middleware/app` (portal, setup, reconciler), `postgres-init` and `clickhouse-init` (sample data and the
 manager accounts), `vault/` (Vault image with the pinned ClickHouse plugin), `tests/unit`, `tests/integration`.
-Unit tests need no Docker. Integration tests (`tests/integration`) run against the real compose stack and include the
-security regression tests: each one proves that an original exploit fails. `make check` sets
+Unit tests need no Docker (two of them call `docker compose config`). Integration tests (`tests/integration`) run
+against the real compose stack and include the security regression tests: each one checks the behaviour named in
+its title against the real services (for example the exploit request is refused, or the account is really gone in
+the database). They are regression tests, not a proof of absence of other flaws. `make check` sets
 `VDBA_REQUIRE_STACK=1`, so an unreachable stack is a failure, never a skip, and starts the stack with
 `VDBA_TEST_HOOKS=1` (fault injection for crash tests and a 2-hour test-admin token in `secrets/test-admin-token`;
 never use that in production). CI (`.github/workflows/ci.yml`) runs everything plus pip-audit, hadolint, actionlint
@@ -245,9 +299,16 @@ and Trivy.
 | Default / placeholder secrets | `test_12_stack_refuses_to_start_with_changeme` |
 | SQLite WAL readable, session ids stored in clear | `test_sqlite_files_and_session_ids_are_private` |
 | One database down hides the other, backend errors leak | `test_one_database_down_does_not_hide_the_other_catalog`, `test_errors_never_leak_backend_text` |
+| Old service tokens never revoked on re-login | `test_service_relogin_revokes_the_previous_token` |
+| Existing connector with extra privileges, memberships or a foreign username template | `test_setup_refuses_a_postgres_manager_with_dangerous_memberships`, `test_setup_refuses_a_clickhouse_manager_with_extra_grants_or_roles`, `test_setup_refuses_a_connector_with_a_foreign_username_template`, `test_setup_without_root_still_rechecks_connectors_and_warns` |
+| PostgreSQL cleanup fails on a role that is already gone (retry, expiry) | `test_cleanup_function_is_idempotent_and_guarded`, `test_revoke_after_the_role_was_already_dropped_is_clean`, `test_vault_expiry_after_the_role_was_already_dropped_is_clean` |
+| Running ClickHouse query survives revoke | `test_clickhouse_running_query_stops_after_revoke` |
+| Oversized chunked JSON body reported as 400 | `test_oversized_chunked_json_body_is_413_not_400` |
+| Real backend failures (paused database / Vault) leak details | `test_real_backend_failures_do_not_leak_details` |
 
 Unit tests cover the SQL builders (identifier validation, sequences, maintenance statements), the request model,
-the preflight check, the SQLite store, templates, the reconciler's decisions and admission limits.
+the preflight check, the SQLite store, templates, the reconciler's decisions, admission limits, token discovery
+error handling, TLS settings, compose passthrough of production settings and the release override.
 
 ## License
 

@@ -17,7 +17,11 @@ CREATE USER vault_manager IDENTIFIED WITH sha256_password BY '${MGR_PW}';
 GRANT CREATE USER, ALTER USER, DROP USER ON *.* TO vault_manager;
 GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON appdb.* TO vault_manager WITH GRANT OPTION;
 -- lets setup's least-privilege probe (run AS vault_manager) read the manager's own grants
-GRANT SELECT(user_name, access_type) ON system.grants TO vault_manager;
+GRANT SELECT(user_name, access_type, database) ON system.grants TO vault_manager;
+GRANT SELECT(user_name, granted_role_name) ON system.role_grants TO vault_manager;
+-- revocation kills the recipient's running queries (DROP USER alone leaves them running)
+GRANT KILL QUERY ON *.* TO vault_manager;
+GRANT SELECT(query_id, user, query) ON system.processes TO vault_manager;
 
 CREATE USER vault_introspect IDENTIFIED WITH sha256_password BY '${INTRO_PW}';
 GRANT SHOW TABLES ON appdb.* TO vault_introspect;

@@ -20,6 +20,7 @@ from conftest import (
     ch_user_exists,
     dc,
     eventually,
+    need,
     pg_connect,
     pg_introspect,
     pg_role_exists,
@@ -106,6 +107,18 @@ def test_02c_root_token_revoked_and_audit_device_on():
     keys = json.loads((ROOT / "secrets" / "vault-keys.json").read_text())
     assert (ROOT / "secrets" / "vault-keys.json").stat().st_mode & 0o077 == 0
     assert "keys" in keys
+    assert "root_token" not in keys
+    assert keys.get("root_accessor"), "setup must record the root token's accessor so its death can be checked"
+    from conftest import token_info
+
+    admin_token = (
+        (ROOT / "secrets" / "test-admin-token").read_text().strip()
+        if (ROOT / "secrets" / "test-admin-token").exists()
+        else None
+    )
+    if admin_token is None:
+        need("no test-admin token to confirm the root accessor is dead")
+    assert token_info(admin_token, keys["root_accessor"]) is None, "the root token is still alive in Vault"
     out = dc("exec", "-T", "vault", "sh", "-c", "ls -l /vault/logs/audit.log").stdout
     assert "audit.log" in out
 
@@ -428,6 +441,7 @@ def test_08c_clickhouse_grant_is_limited_and_cannot_drop(admin, grants):
 def test_09_interrupted_issue_is_cleaned_by_the_reconciler(hooks, admin, point):
     with pg_introspect() as c:
         before = {r[0] for r in c.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE 'vdba\\_%'").fetchall()}
+    grants_before = {g["grant_id"] for g in admin.get("/api/grants").json()}
     dc("exec", "-T", "middleware", "sh", "-c", f"echo {point} > /data/fault-point")
     with pytest.raises(requests.exceptions.ConnectionError):
         admin.post(
@@ -449,9 +463,9 @@ def test_09_interrupted_issue_is_cleaned_by_the_reconciler(hooks, admin, point):
 
     def cleaned():
         rows = admin.get("/api/grants").json()
+        new = [g for g in rows if g["grant_id"] not in grants_before]  # THIS operation's grant, not an older one
         stuck = [g for g in rows if g["status"] in ("issuing", "revoking")]
-        failed = [g for g in rows if g["status"] == "failed" and g["requested_for"] == "pytest"]
-        return not stuck and failed
+        return len(new) == 1 and new[0]["status"] == "failed" and not stuck
 
     eventually(cleaned, timeout=90, interval=2)
     with pg_introspect() as c:

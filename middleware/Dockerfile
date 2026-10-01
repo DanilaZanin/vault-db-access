@@ -9,8 +9,9 @@ RUN uv sync --frozen --no-dev --no-install-project
 # ---- runtime stage: no uv, no pip-installed tooling, OS packages upgraded ----
 FROM python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
 ENV PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:$PATH"
-RUN apt-get update && apt-get -y upgrade && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && pip uninstall -y pip setuptools wheel 2>/dev/null; true
+RUN apt-get update && apt-get -y upgrade && apt-get clean && rm -rf /var/lib/apt/lists/*
+# the runtime image needs no package installer (a missing package only warns, it does not fail)
+RUN python -m pip uninstall -y pip setuptools wheel
 WORKDIR /app
 COPY --from=build /opt/venv /opt/venv
 COPY middleware/app ./app

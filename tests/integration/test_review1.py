@@ -14,9 +14,11 @@ from conftest import (
     ENV,
     VAULT,
     Portal,
+    all_tokens,
     ch_introspect,
     dc,
     eventually,
+    need,
     pg_connect,
     pg_role_exists,
 )
@@ -37,7 +39,7 @@ def sql_in_middleware(code: str) -> str:
 def test_session_ends_when_admin_rights_are_removed(root_token, stack, how):
     recheck = stack["recheck"]
     if recheck > 60:
-        pytest.skip("stack not started with a short VDBA_SESSION_RECHECK_SECONDS (make check does)")
+        need("stack not started with a short VDBA_SESSION_RECHECK_SECONDS (make check does)")
     name = f"tmpadmin-{uuid.uuid4().hex[:8]}"
     path = f"auth/userpass/users/{name}"
     assert (
@@ -235,13 +237,31 @@ def test_partial_clickhouse_account_is_removed_when_a_later_grant_fails(admin, h
 
 # 8 / 10 ------------------------------------------------------------------------------------------
 def test_lost_token_create_response_does_not_leave_a_live_token(root_token, hooks, admin):
+    def grant_tokens():
+        # Vault stores display names as "token-" + name with "_" rewritten to "-"
+        return {
+            t["accessor"]: t for t in all_tokens(root_token) if (t.get("display_name") or "").startswith("token-vdba-")
+        }
+
+    tokens_before = set(grant_tokens())
     before = {x["grant_id"] for x in admin.get("/api/grants").json()}
     dc("exec", "-T", "middleware", "sh", "-c", "echo after_token_create > /data/fault-point")
     with pytest.raises(requests.exceptions.ConnectionError):
-        admin.post("/api/grants", json={
-            "db_type": "postgres", "scope": "tables", "tables": ["customers"], "commands": ["SELECT"],
-            "ttl_seconds": 600, "requested_for": "lost-token",
-        })  # fmt: skip
+        admin.post(
+            "/api/grants",
+            json={
+                "db_type": "postgres",
+                "scope": "tables",
+                "tables": ["customers"],
+                "commands": ["SELECT"],
+                "ttl_seconds": 600,
+                "requested_for": "lost-token",
+            },
+        )
+    # NOT vacuous: right after the crash exactly one new grant token exists and nothing has recorded its accessor
+    created = set(grant_tokens()) - tokens_before
+    assert len(created) == 1, created
+    (accessor,) = created
     eventually(lambda: requests.get(f"{BASE}/healthz", timeout=2).ok, timeout=90, interval=1)
 
     def failed():
@@ -249,14 +269,9 @@ def test_lost_token_create_response_does_not_leave_a_live_token(root_token, hook
         return rows and rows[0]["status"] == "failed" and rows[0]["grant_id"]
 
     gid = eventually(failed, timeout=90, interval=2)
-    # independent check with root: no live token carries this grant's name
-    accessors = vault(root_token, "LIST", "auth/token/accessors").json()["data"]["keys"]
-    names = []
-    for a in accessors:
-        r = vault(root_token, "POST", "auth/token/lookup-accessor", {"accessor": a})
-        if r.status_code == 200:
-            names.append(r.json()["data"].get("display_name"))
-    assert not any(gid in (n or "") for n in names), "the orphaned grant token is still alive"
+    from conftest import token_info
+
+    assert token_info(root_token, accessor) is None, f"the orphaned grant token of {gid} is still alive"
 
 
 # 9 ---------------------------------------------------------------------------------------------

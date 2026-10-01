@@ -21,8 +21,14 @@ CLICKHOUSE_HTTP_PORT = _int("VDBA_CLICKHOUSE_HTTP_PORT", 8123)
 CLICKHOUSE_NATIVE_PORT = _int("VDBA_CLICKHOUSE_NATIVE_PORT", 9000)
 CLICKHOUSE_DB = "appdb"
 DB_TIMEOUT = 8
-# Transport to Postgres. The demo runs plain on the internal docker network and needs VDBA_ALLOW_INSECURE=1.
-PG_SSLMODE = os.environ.get("VDBA_PG_SSLMODE", "")
+# Transport to the databases. The demo runs plain on the internal docker network and needs VDBA_ALLOW_INSECURE=1.
+PG_SSLROOTCERT = os.environ.get("VDBA_PG_SSLROOTCERT", "")
+ALLOW_INSECURE = os.environ.get("VDBA_ALLOW_INSECURE") == "1"
+PG_SSLMODE = os.environ.get("VDBA_PG_SSLMODE") or (
+    "verify-full" if PG_SSLROOTCERT else ("prefer" if ALLOW_INSECURE else "require")
+)
+CH_SECURE = os.environ.get("VDBA_CH_SECURE") == "1"
+CH_CA_CERT = os.environ.get("VDBA_CH_CA_CERT", "")
 
 # Names of the objects created by `app.setup`.
 CONNECTION_NAMES = {"postgres": "postgres", "clickhouse": "clickhouse"}
@@ -50,6 +56,7 @@ BODY_LIMIT = 64 * 1024
 MAX_ISSUE_OPS = 6  # issue, catalog reads, rotate
 MAX_REVOKE_OPS = 4  # reserved so a flood of issues can never starve revocation
 MAX_AUTH_OPS = 4  # logins
+MAX_SESSION_CHECKS = 8  # session re-validation against Vault
 
 RECONCILE_INTERVAL = _int("VDBA_RECONCILE_INTERVAL", 60)
 TEST_HOOKS = os.environ.get("VDBA_TEST_HOOKS") == "1"
@@ -58,7 +65,6 @@ FAULT_FILE = os.environ.get("VDBA_FAULT_FILE", "/data/fault-point")
 PUBLIC_ORIGIN = os.environ.get("VDBA_PUBLIC_ORIGIN", "")
 EXTRA_ORIGINS = {o for o in os.environ.get("VDBA_ALLOWED_ORIGINS", "").split(",") if o}
 COOKIE_SECURE = os.environ.get("VDBA_COOKIE_SECURE", "auto")  # auto | 1 | 0
-ALLOW_INSECURE = os.environ.get("VDBA_ALLOW_INSECURE") == "1"
 
 
 def check_transport() -> None:

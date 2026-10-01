@@ -8,3 +8,10 @@ __pycache__/
 .ruff_cache/
 .venv/
 dist/
+.ai/
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.requirements-audit.txt
+backup.sqlite3

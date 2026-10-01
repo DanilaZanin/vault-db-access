@@ -25,6 +25,7 @@ _admission = {
     "issue": threading.BoundedSemaphore(config.MAX_ISSUE_OPS),
     "revoke": threading.BoundedSemaphore(config.MAX_REVOKE_OPS),
     "auth": threading.BoundedSemaphore(config.MAX_AUTH_OPS),
+    "session": threading.BoundedSemaphore(config.MAX_SESSION_CHECKS),
 }
 
 

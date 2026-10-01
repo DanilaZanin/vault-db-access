@@ -62,13 +62,18 @@ path "sys/leases/revoke/database/creds/vdba_*" { capabilities = ["update"] }
 # (listing leases requires sudo in Vault; scoped to our own role prefix only)
 path "sys/leases/lookup/database/creds/vdba_*" { capabilities = ["list", "sudo"] }
 path "auth/token/lookup-self" { capabilities = ["read"] }
+# Needed to revoke its own previous token on re-login (token_no_default_policy drops the default policy's grant).
+path "auth/token/revoke-self" { capabilities = ["update"] }
+# Read-only view of the two connections (never returns the password): lets a later setup run re-check them.
+path "database/config/postgres" { capabilities = ["read"] }
+path "database/config/clickhouse" { capabilities = ["read"] }
 # Session re-validation reads the CURRENT policies of an admin user (never the password hash).
 path "auth/userpass/users/*" { capabilities = ["read"] }
 # Recovery of a grant token whose create response was lost: find it by its display name (grant id).
 # Accessors are not credentials; listing them needs sudo on this one path.
 path "auth/token/accessors" { capabilities = ["list", "sudo"] }
 path "auth/token/lookup-accessor" { capabilities = ["update"] }
-# Deliberately absent: sys/policies/*, database/config/*, database/creds/*, sys/leases/revoke-prefix.
+# Deliberately absent: sys/policies/*, database/config WRITES, database/creds/*, sys/leases/revoke-prefix.
 """
 CREDS_READER_POLICY = 'path "database/creds/vdba_*" { capabilities = ["read"] }\n'
 ADMIN_POLICY = (
@@ -163,32 +168,56 @@ def ensure_engines(c: hvac.Client) -> None:
 
 PROBES = {
     # Run AS the connection's own DB account (through a throw-away role); a statement error = unsafe.
+    # PostgreSQL: no superuser-like attributes, no membership in ANY predefined pg_* role (pg_execute_server_program,
+    # pg_read_server_files, ... directly or through inheritance) and none in any role that is not one of ours.
     "postgres": [
-        "SELECT 1 / (CASE WHEN (SELECT rolsuper OR rolbypassrls OR rolreplication OR NOT rolcreaterole "
-        "FROM pg_roles WHERE rolname = current_user) THEN 0 ELSE 1 END)"
+        "SELECT 1 / (CASE WHEN "
+        "(SELECT rolsuper OR rolbypassrls OR rolreplication OR rolcreatedb OR NOT rolcreaterole "
+        " FROM pg_roles WHERE rolname = current_user) "
+        "OR EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname LIKE 'pg\\_%' "
+        " AND pg_has_role(current_user, r.oid, 'MEMBER')) "
+        "OR EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid "
+        " WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user) AND g.rolname NOT LIKE 'vdba\\_%') "
+        "THEN 0 ELSE 1 END)"
     ],
+    # ClickHouse: the EFFECTIVE grants must be exactly the allowlist (no roles at all, nothing outside appdb/system).
     "clickhouse": [
-        "SELECT throwIf((SELECT count() FROM system.grants WHERE user_name = currentUser() AND "
-        "access_type IN ('ALL', 'ACCESS MANAGEMENT', 'ROLE ADMIN', 'ALTER ROLE', 'CREATE ROLE')) > 0)"
+        "SELECT throwIf("
+        "(SELECT count() FROM system.grants WHERE user_name = currentUser() AND ("
+        "access_type NOT IN ('KILL QUERY', 'CREATE USER', 'ALTER USER', 'DROP USER', 'SELECT', 'INSERT', "
+        "'ALTER UPDATE', 'ALTER DELETE') OR (database IS NOT NULL AND database NOT IN ('appdb', 'system')))) > 0 "
+        "OR (SELECT count() FROM system.role_grants WHERE user_name = currentUser()) > 0)"
     ],
 }
 
 
-def validate_connection(c: hvac.Client, name: str) -> None:
-    """Refuse a connection that is not our least-privilege manager: wrong account name, or an account that
-    actually has superuser-like rights (checked by running a probe as that account). Raises SystemExit."""
-    cfg = c.read(f"database/config/{name}")["data"]
-    user = cfg["connection_details"].get("username")
-    if user != "vault_manager":
+def check_connection_config(c: hvac.Client, name: str) -> None:
+    """The parts that can be checked without running anything: the account and the username template (the
+    reconciler finds a grant's accounts by that template's `<grant id>_` prefix)."""
+    cfg = c.read(f"database/config/{name}")["data"]["connection_details"]
+    if cfg.get("username") != "vault_manager":
         raise SystemExit(
-            f"connection {name!r} uses account {user!r}, not 'vault_manager': refusing to continue. "
+            f"connection {name!r} uses account {cfg.get('username')!r}, not 'vault_manager': refusing to continue. "
             f"Delete it (vault delete database/config/{name}) and re-run setup"
         )
+    if cfg.get("username_template") != USERNAME_TEMPLATE:
+        raise SystemExit(
+            f"connection {name!r} has username_template {cfg.get('username_template')!r}, expected "
+            f"{USERNAME_TEMPLATE!r}: cleanup of half-created accounts depends on it; refusing to continue"
+        )
+
+
+def validate_connection(c: hvac.Client, name: str, kind: str | None = None) -> None:
+    """Refuse a connection that is not our least-privilege manager: wrong account name, foreign username
+    template, or an account whose EFFECTIVE privileges exceed the allowlist (checked by running a probe as that
+    account). Needs a privileged client. Raises SystemExit."""
+    check_connection_config(c, name)
+    kind = kind or name
     probe_role = f"vdba_probe_{name}"
     c.write(
         f"database/roles/{probe_role}",
         db_name=name,
-        creation_statements=PROBES[name],
+        creation_statements=PROBES[kind],
         revocation_statements=["SELECT 1"],
         default_ttl="30s",
         max_ttl="30s",
@@ -198,22 +227,34 @@ def validate_connection(c: hvac.Client, name: str) -> None:
         lease = c.read(f"database/creds/{probe_role}")["lease_id"]
     except vexc.VaultError as exc:
         raise SystemExit(
-            f"connection {name!r} failed the least-privilege probe (superuser-like rights?): refusing. {exc}"
+            f"connection {name!r} failed the least-privilege probe (extra privileges or role memberships?): "
+            f"refusing. {exc}"
         ) from exc
     finally:
         if lease:
             c.write(f"sys/leases/revoke/{lease}")
         c.delete(f"database/roles/{probe_role}")
-    log(f"connection {name!r} verified: account vault_manager, no superuser-like rights")
+    log(f"connection {name!r} verified: account vault_manager, our username template, privileges within the allowlist")
+
+
+WEAK_SSLMODES = {"disable", "allow", "prefer"}
+SSLMODES = WEAK_SSLMODES | {"require", "verify-ca", "verify-full"}
 
 
 def pg_sslmode() -> str:
     mode = os.environ.get("VDBA_PG_SSLMODE", "")
+    insecure_ok = os.environ.get("VDBA_ALLOW_INSECURE") == "1"
+    if mode and mode not in SSLMODES:
+        raise SystemExit(f"VDBA_PG_SSLMODE={mode!r} is not one of {sorted(SSLMODES)}")
+    if mode in WEAK_SSLMODES and not insecure_ok:
+        raise SystemExit(
+            f"VDBA_PG_SSLMODE={mode} sends data without verified TLS: needs VDBA_ALLOW_INSECURE=1 (demo only)"
+        )
     if mode:
         return mode
     if os.environ.get("VDBA_PG_SSLROOTCERT"):
         return "verify-full"
-    if os.environ.get("VDBA_ALLOW_INSECURE") != "1":
+    if not insecure_ok:
         raise SystemExit(
             "no TLS configured for Postgres: set VDBA_PG_SSLMODE (e.g. verify-full) or VDBA_PG_SSLROOTCERT, "
             "or set VDBA_ALLOW_INSECURE=1 to accept plain text on the internal network (demo only)"
@@ -256,7 +297,8 @@ def ensure_connections(c: hvac.Client, env: dict[str, str]) -> None:
         "clickhouse",
         PLUGIN_NAME,
         f"clickhouse://{config.CLICKHOUSE_HOST}:{config.CLICKHOUSE_NATIVE_PORT}"
-        "?username={{username}}&password={{password}}&dial_timeout=10s",
+        "?username={{username}}&password={{password}}&dial_timeout=10s"
+        + ("&secure=true" if os.environ.get("VDBA_CH_SECURE") == "1" else ""),
         "vault_manager",
         env["CLICKHOUSE_MANAGER_PASSWORD"],
     )
@@ -313,6 +355,26 @@ def approle_login_ok(role_id: str, secret_id: str) -> bool:
         return False
 
 
+def recheck_without_root() -> None:
+    """No privileged token: re-check what the service identity may read (account + username template of both
+    connections) and say loudly what could not be re-checked."""
+    svc = client()
+    svc.auth.approle.login(
+        role_id=(APPROLE_OUT / "role_id").read_text().strip(), secret_id=(APPROLE_OUT / "secret_id").read_text().strip()
+    )
+    for name in ("postgres", "clickhouse"):
+        try:
+            check_connection_config(svc, name)
+        except vexc.Forbidden:
+            log(f"WARNING: cannot read connector {name!r} with the service identity (older policy): NOT re-checked")
+            continue
+        log(f"connector {name!r} re-checked with the service identity (account and username_template ok)")
+    log(
+        "WARNING: the root token is revoked, so the least-privilege probe was NOT re-run: the effective privileges "
+        "of the vault_manager accounts were not re-validated. Re-run setup with a root token to do that."
+    )
+
+
 def deliver_approle(c: hvac.Client) -> None:
     """Writes role_id / secret_id into /secrets/approle (the only directory the middleware mounts)."""
     APPROLE_OUT.mkdir(parents=True, exist_ok=True)
@@ -361,8 +423,10 @@ def revoke_root(c: hvac.Client, keep: bool) -> None:
     if keep:
         log("--keep-root: root token left in place (revoke it yourself when done)")
         return
-    c.auth.token.revoke_self()
     keys = load_keys()
+    keys["root_accessor"] = c.auth.token.lookup_self()["data"]["accessor"]  # lets anyone confirm the token is dead
+    write_private(KEYS_FILE, json.dumps(keys), uid=HOST_UID)
+    c.auth.token.revoke_self()
     keys.pop("root_token", None)
     write_private(KEYS_FILE, json.dumps(keys), uid=HOST_UID)
     (SECRETS / "root-token").unlink(missing_ok=True)
@@ -390,11 +454,13 @@ def main() -> None:
             and sid_f.exists()
             and approle_login_ok(role_id_f.read_text().strip(), sid_f.read_text().strip())
         ):
-            log("already provisioned (root token is revoked and the AppRole login works); nothing to do")
+            log("already provisioned (root token is revoked and the AppRole login works); nothing to provision")
+            recheck_without_root()
             return
         raise SystemExit(
-            "no usable root token. If this is a re-run after the root token was revoked, generate a new one "
-            "with `vault operator generate-root`, put it in ./secrets/root-token and run setup again."
+            "no usable root token and the AppRole files are missing or invalid. To get a new root token follow "
+            "README 'Getting a new root token' (it needs `enable_unauthenticated_access = [\"generate-root\"]` in the "
+            "Vault server config for the duration of the procedure), put it in ./secrets/root-token, run setup again."
         )
     ensure_audit(root)  # first, so everything after it is audited
     ensure_engines(root)

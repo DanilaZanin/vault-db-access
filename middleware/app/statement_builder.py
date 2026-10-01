@@ -67,14 +67,9 @@ def build_postgres_statements(
             for seq in sequences.get(t, []):
                 valid_identifier(seq)
                 statements.append(f'GRANT USAGE ON SEQUENCE "public"."{seq}" TO "{{{{name}}}}";')
-    revocation = [
-        "SET LOCAL lock_timeout = '5s';",
-        "SET LOCAL statement_timeout = '20s';",
-        'ALTER ROLE "{{name}}" NOLOGIN;',
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{{name}}';",
-        'DROP OWNED BY "{{name}}";',
-        'DROP ROLE IF EXISTS "{{name}}";',
-    ]
+    # One idempotent, time-bounded statement (installed by postgres-init/02-roles.sh): conditional lockout,
+    # session termination until none are left, DROP OWNED, DROP ROLE; a missing role is a no-op.
+    revocation = ["SELECT vdba.cleanup_role('{{name}}');"]
     return statements, revocation
 
 
@@ -89,6 +84,7 @@ def build_clickhouse_statements(
     for t in chosen:
         statements.append(f"GRANT {cmds} ON `{config.CLICKHOUSE_DB}`.`{t}` TO '{{{{name}}}}';")
     revocation = [
+        "KILL QUERY WHERE user = '{{name}}' SYNC;",  # DROP USER alone does not stop a running query
         "DROP USER IF EXISTS '{{name}}';",
     ]
     return statements, revocation
@@ -118,26 +114,22 @@ def valid_account(name: str) -> str:
 
 
 def lockout_statements(db_type: DbType, account: str) -> list[str]:
-    """Committed lockout: no new logins. (ClickHouse needs no separate step: DROP USER is immediate.)"""
+    """Committed lockout: no new logins (no-op if the role is already gone). ClickHouse: nothing to do."""
     valid_account(account)
     if db_type == DbType.postgres:
-        return ["SET LOCAL lock_timeout = '3s';", f'ALTER ROLE "{account}" NOLOGIN;']
+        return [f"SELECT vdba.lockout_role('{account}');"]  # noqa: S608
     return []
 
 
 def terminate_statements(db_type: DbType, account: str) -> list[str]:
     valid_account(account)
     if db_type == DbType.postgres:
-        return [f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{account}';"]  # noqa: S608 - validated
-    return []
+        return [f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{account}';"]  # noqa: S608
+    return [f"KILL QUERY WHERE user = '{account}' SYNC;"]
 
 
 def drop_statements(db_type: DbType, account: str) -> list[str]:
     valid_account(account)
     if db_type == DbType.postgres:
-        return [
-            "SET LOCAL lock_timeout = '5s';",
-            f'DROP OWNED BY "{account}";',
-            f'DROP ROLE IF EXISTS "{account}";',
-        ]
-    return [f"DROP USER IF EXISTS '{account}';"]
+        return [f"SELECT vdba.cleanup_role('{account}');"]  # noqa: S608
+    return [f"KILL QUERY WHERE user = '{account}' SYNC;", f"DROP USER IF EXISTS '{account}';"]

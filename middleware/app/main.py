@@ -68,19 +68,23 @@ class Guard:
         if length is not None and (not length.isdigit() or int(length) > config.BODY_LIMIT):
             return await self._reject(send, rid, 413, "request body too large")
         received = 0
+        exceeded = False
 
         async def counting_receive():
             # Count real bytes on the stream: Content-Length alone proves nothing for chunked bodies.
-            nonlocal received
+            nonlocal received, exceeded
             msg = await receive()
             if msg["type"] == "http.request":
                 received += len(msg.get("body", b""))
                 if received > config.BODY_LIMIT:
+                    exceeded = True
                     raise TooLarge()
             return msg
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
+                if exceeded and message["status"] == 400:
+                    message["status"] = 413  # FastAPI turns any body-read error on JSON endpoints into a 400
                 h = message.setdefault("headers", [])
                 h += [
                     (b"x-request-id", rid.encode()),
@@ -214,8 +218,12 @@ def current_session(request: Request) -> dict | None:
     if now - s["last_check"] > config.SESSION_RECHECK_SECONDS:
         # Re-validate against the CURRENT state: the token's own policy list is frozen at login, so
         # deleting the user or removing db-access-admin would otherwise go unnoticed.
-        current = vault_client.user_policies(s["username"])
-        alive = vault_client.token_policies(s["vault_token"])
+        try:
+            with grants.admit("session"):  # admission BEFORE any Vault I/O, separate from issue/revoke capacity
+                current = vault_client.user_policies(s["username"])
+                alive = vault_client.token_policies(s["vault_token"])
+        except grants.Busy as exc:
+            raise HTTPException(503, str(exc)) from exc
         if not current or config.ADMIN_POLICY_NAME not in current or not alive:
             store.delete_session(sid)
             vault_client.revoke_token_quietly(s["vault_token"])
