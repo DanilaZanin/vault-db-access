@@ -102,7 +102,8 @@ def test_sslmode_is_validated_and_strong_modes_pass(monkeypatch):
 # N7 ---------------------------------------------------------------------------------------------
 def _compose_config(env, *files):
     args = ["docker", "compose", *[x for f in files for x in ("-f", f)], "config", "--format", "json"]
-    out = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, check=True, env=env)  # noqa: S603
+    out = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, check=False, env=env)  # noqa: S603
+    assert out.returncode == 0, f"docker compose config failed ({out.returncode}): {out.stderr}"
     return json.loads(out.stdout)
 
 
