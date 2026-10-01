@@ -239,8 +239,8 @@ Residual risks you must know about:
 - Published images (available after the first `v*` tag is released) are built for amd64 and arm64 with SBOM and
   provenance attestations. The release workflow scans every platform digest with Trivy before it promotes `latest`
   (stable tags only), signs both images with cosign keyless and verifies the signatures against the exact workflow
-  identity. The GitHub release lists both digests and attaches the full Trivy reports. GHCR packages are private
-  until the owner sets them public (package settings); anonymous pulls and `make up-release` need that.
+  identity. The GitHub release lists both digests and attaches the full Trivy reports. Both GHCR packages are public,
+  so anonymous pulls and `make up-release` work without a login.
   Verify BOTH images, then run exactly the digests you verified:
   ```
   V=v0.1.0
@@ -252,8 +252,8 @@ Residual risks you must know about:
   # use the digests printed by cosign (or listed in the release notes):
   VDBA_VERSION=$V VDBA_MIDDLEWARE_DIGEST=sha256:... VDBA_VAULT_DIGEST=sha256:... make up-release
   ```
-  `make up-release` is `docker compose -f docker-compose.yml -f compose.release.yml ...`. I could not run these
-  commands before a release exists.
+  `make up-release` is `docker compose -f docker-compose.yml -f compose.release.yml ...`. Checked for v0.1.0:
+  both signatures verify, and a fresh clone with the two digests reaches a healthy portal in about 2.5 minutes.
 
 ## What it does not do yet (ideas for v0.2)
 
