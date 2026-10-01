@@ -284,3 +284,69 @@ def test_oversized_chunked_json_body_is_413_not_400(admin):
 
 
 _ = (re, subprocess, uuid, Portal, ROOT)
+
+
+# TLS settings must actually reach the middleware's database connections --------------------------
+def _recreate_middleware(extra_env: dict[str, str]) -> None:
+    import os
+
+    env = {
+        **os.environ,
+        "VDBA_TEST_HOOKS": "1",
+        "VDBA_RECONCILE_INTERVAL": "5",
+        "VDBA_SESSION_RECHECK_SECONDS": "5",
+        **extra_env,
+    }
+    subprocess.run(  # noqa: S603
+        ["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", "middleware"],  # noqa: S607
+        cwd=ROOT, env=env, check=True, capture_output=True, timeout=300,
+    )  # fmt: skip
+    eventually(lambda: requests.get(f"{BASE}/healthz", timeout=2).ok, timeout=90, interval=1)
+
+
+def _introspect_from_middleware(call: str) -> subprocess.CompletedProcess:
+    code = f"from app import db_introspect as d; print({call})"
+    return subprocess.run(  # noqa: S603
+        ["docker", "compose", "exec", "-T", "middleware", "python", "-c", code],  # noqa: S607
+        cwd=ROOT, capture_output=True, text=True, timeout=120,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("env", "call", "needle"),
+    [
+        (
+            {"VDBA_PG_SSLMODE": "verify-full", "VDBA_PG_SSLROOTCERT": "/nonexistent/ca.pem"},
+            "d.postgres_catalog().tables",
+            "ssl",  # the demo server has no TLS: "server does not support SSL, but SSL was required"
+        ),
+        ({"VDBA_CH_SECURE": "1"}, "d.clickhouse_catalog().tables", "ssl"),
+    ],
+)
+def test_tls_settings_reach_the_database_connections(env, call, needle):
+    baseline = _introspect_from_middleware(call)
+    assert baseline.returncode == 0, baseline.stderr[-300:]  # demo transport works (plain, VDBA_ALLOW_INSECURE=1)
+    _recreate_middleware(env)
+    try:
+        r = _introspect_from_middleware(call)
+        assert r.returncode != 0, f"connected without TLS despite {env}: {r.stdout}"
+        assert needle in r.stderr.lower(), r.stderr[-400:]
+    finally:
+        _recreate_middleware({})
+    eventually(lambda: requests.get(f"{BASE}/healthz", timeout=2).ok, timeout=60)
+    assert _introspect_from_middleware(call).returncode == 0
+
+
+def test_middleware_refuses_to_start_with_weak_sslmode_without_the_insecure_flag():
+    def start(env):
+        return subprocess.run(  # noqa: S603
+            ["docker", "compose", "run", "--rm", "--no-deps", "-T", "-e", "VDBA_ALLOW_INSECURE=0",
+             *[x for k, v in env.items() for x in ("-e", f"{k}={v}")], "middleware",
+             "python", "-c", "import app.main"],  # fmt: skip
+            cwd=ROOT, capture_output=True, text=True, timeout=120,
+        )  # fmt: skip
+
+    for mode in ("disable", "allow", "prefer", "bogus"):
+        r = start({"VDBA_PG_SSLMODE": mode})
+        assert r.returncode != 0 and "VDBA_PG_SSLMODE" in r.stderr, (mode, r.stderr[-300:])
+    assert start({"VDBA_PG_SSLMODE": "require"}).returncode == 0

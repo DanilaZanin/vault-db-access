@@ -49,6 +49,7 @@ def _pg_connect() -> psycopg.Connection:
         connect_timeout=config.DB_TIMEOUT,
         autocommit=True,
         options=f"-c statement_timeout={config.DB_TIMEOUT * 1000}",
+        **pg_ssl_kwargs(),
     )
 
 
@@ -61,6 +62,7 @@ def _ch_client():
         password=password,
         connect_timeout=config.DB_TIMEOUT,
         send_receive_timeout=config.DB_TIMEOUT,
+        **ch_ssl_kwargs(),
     )
 
 

@@ -67,8 +67,17 @@ EXTRA_ORIGINS = {o for o in os.environ.get("VDBA_ALLOWED_ORIGINS", "").split(","
 COOKIE_SECURE = os.environ.get("VDBA_COOKIE_SECURE", "auto")  # auto | 1 | 0
 
 
+WEAK_SSLMODES = {"disable", "allow", "prefer"}
+SSLMODES = WEAK_SSLMODES | {"require", "verify-ca", "verify-full"}
+
+
 def check_transport() -> None:
-    """Refuse a plain-HTTP public origin on a non-loopback host unless explicitly allowed."""
+    """Refuse weak/unknown Postgres sslmodes and a plain-HTTP public origin on a non-loopback host unless the
+    operator explicitly accepts plain text with VDBA_ALLOW_INSECURE=1."""
+    if PG_SSLMODE not in SSLMODES:
+        raise SystemExit(f"VDBA_PG_SSLMODE={PG_SSLMODE!r} is not one of {sorted(SSLMODES)}")
+    if PG_SSLMODE in WEAK_SSLMODES and not ALLOW_INSECURE:
+        raise SystemExit(f"VDBA_PG_SSLMODE={PG_SSLMODE} needs VDBA_ALLOW_INSECURE=1 (demo only)")
     if not PUBLIC_ORIGIN:
         return
     parts = urlsplit(PUBLIC_ORIGIN)

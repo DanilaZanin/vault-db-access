@@ -190,9 +190,16 @@ Residual risks you must know about:
 - Put TLS in front of the portal (reverse proxy) and set `VDBA_PUBLIC_ORIGIN=https://...`; the portal refuses a
   plain-http public origin on a non-loopback host unless `VDBA_ALLOW_INSECURE=1`.
 - Run Vault with a TLS listener (edit `VAULT_LOCAL_CONFIG` in `docker-compose.yml`) and change `VAULT_ADDR`.
-- PostgreSQL: set `VDBA_PG_SSLMODE=verify-full` and `VDBA_PG_SSLROOTCERT=<path to the CA inside the vault container>`
-  before setup, and remove `VDBA_ALLOW_INSECURE`. Setup refuses to run without either a TLS setting or the explicit
-  insecure flag. ClickHouse transport is not configured by this repo: use a secure port and TLS on your server.
+- PostgreSQL: set `VDBA_PG_SSLMODE=verify-full` and `VDBA_PG_SSLROOTCERT=<path to the CA>` in `.env`, and remove
+  `VDBA_ALLOW_INSECURE`. The same variables are used by Vault (its connection to Postgres, set once by setup) and by
+  the middleware (its introspection connection), so the CA file must be readable at that path in BOTH the vault and
+  the middleware containers (mount it into both). Setup and the middleware refuse `disable`, `allow` and `prefer`
+  (and unknown values) unless `VDBA_ALLOW_INSECURE=1`, and setup refuses to run with no TLS setting at all.
+- ClickHouse: enable TLS on the server (the secure native port, usually 9440, and the secure HTTP port, usually
+  8443; the demo server does not enable them). Then set `VDBA_CH_SECURE=1`, `VDBA_CH_CA_CERT=<path to the CA>`,
+  `VDBA_CLICKHOUSE_NATIVE_PORT=9440` and `VDBA_CLICKHOUSE_HTTP_PORT=8443`. `VDBA_CH_SECURE=1` makes the middleware
+  verify the server certificate over HTTPS and makes setup add `secure=true` to Vault's native connection. The
+  plugin's own CA handling is limited: use a certificate that the vault container already trusts.
 - Use a dedicated ClickHouse instance. Remove or lock down `bootstrap_admin` and do not publish its port.
 - Back up the `/data` volume. The SQLite file contains the admins' Vault login tokens (8 h, marker policy only) and
   hashed session ids, so store the copy like a secret and keep it OUT of the repository directory:

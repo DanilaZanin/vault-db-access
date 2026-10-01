@@ -159,3 +159,30 @@ def test_admission_limits_leave_threads_for_revocation():
     total = sum(s._initial_value for s in grants._admission.values())  # noqa: SLF001
     assert total < 40, "anyio's default threadpool has 40 threads: the admission limits must leave spare ones"
     assert "session" in grants._admission and "revoke" in grants._admission  # noqa: SLF001
+
+
+# the settings must be USED, not just defined -------------------------------------------------------
+def test_db_connections_pass_the_ssl_kwargs(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(vault_client, "introspect_credentials", lambda db: ("u", "p"))
+    monkeypatch.setattr(config, "PG_SSLMODE", "verify-full")
+    monkeypatch.setattr(config, "PG_SSLROOTCERT", "/ca.pem")
+    monkeypatch.setattr(config, "CH_SECURE", True)
+    monkeypatch.setattr(config, "CH_CA_CERT", "/ch-ca.pem")
+    monkeypatch.setattr(db_introspect.psycopg, "connect", lambda **kw: seen.setdefault("pg", kw))
+    monkeypatch.setattr(db_introspect.clickhouse_connect, "get_client", lambda **kw: seen.setdefault("ch", kw))
+    db_introspect._pg_connect()  # noqa: SLF001
+    db_introspect._ch_client()  # noqa: SLF001
+    assert seen["pg"]["sslmode"] == "verify-full" and seen["pg"]["sslrootcert"] == "/ca.pem"
+    assert seen["ch"]["secure"] is True and seen["ch"]["verify"] is True and seen["ch"]["ca_cert"] == "/ch-ca.pem"
+
+
+@pytest.mark.parametrize("mode", ["disable", "allow", "prefer", "bogus"])
+def test_middleware_config_rejects_weak_or_unknown_sslmode(monkeypatch, mode):
+    monkeypatch.setattr(config, "PG_SSLMODE", mode)
+    monkeypatch.setattr(config, "ALLOW_INSECURE", False)
+    with pytest.raises(SystemExit):
+        config.check_transport()
+    if mode != "bogus":
+        monkeypatch.setattr(config, "ALLOW_INSECURE", True)
+        config.check_transport()

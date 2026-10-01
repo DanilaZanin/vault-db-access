@@ -93,6 +93,7 @@ jobs:
           provenance: mode=max
 
       - name: scan the PUBLISHED per-platform images (full report incl. unfixed; gate on fixable HIGH/CRITICAL)
+        shell: bash # explicit bash: -e -o pipefail, so a failure inside a pipe fails the step
         env:
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
@@ -104,17 +105,24 @@ jobs:
             IFS='|' read -r name image digest <<< "$entry"
             docker buildx imagetools inspect "${image}@${digest}" --format '{{json .Manifest}}' \
               | jq -r '.manifests[] | select(.platform.os=="linux" and .platform.architecture!="unknown") | "\(.platform.architecture) \(.digest)"' \
-              | while read -r arch pdigest; do
-                  echo "scanning ${name} ${arch} ${pdigest}"
-                  # full report, unfixed findings included, attached to the release
-                  docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/reports:/reports" "$TRIVY_IMAGE" \
-                    image --quiet --format json --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-                    --output "/reports/trivy-${name}-${arch}.json" "${image}@${pdigest}"
-                  # gate: HIGH/CRITICAL that have a fix
-                  docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD "$TRIVY_IMAGE" \
-                    image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${image}@${pdigest}"
-                done
+              > "platforms-${name}.txt"
+            count=$(wc -l < "platforms-${name}.txt")
+            if [ "$count" -lt 2 ]; then
+              echo "expected at least 2 platform digests for ${name}, found ${count}" >&2
+              exit 1
+            fi
+            while read -r arch pdigest; do
+              echo "scanning ${name} ${arch} ${pdigest}"
+              # full report, unfixed findings included, attached to the release
+              docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/reports:/reports" "$TRIVY_IMAGE" \
+                image --quiet --format json --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                --output "/reports/trivy-${name}-${arch}.json" "${image}@${pdigest}"
+              # gate: HIGH/CRITICAL that have a fix
+              docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD "$TRIVY_IMAGE" \
+                image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${image}@${pdigest}"
+            done < "platforms-${name}.txt"
           done
+          test "$(find reports -name 'trivy-*.json' | wc -l)" -ge 4 || { echo "fewer than 4 trivy reports" >&2; exit 1; }
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: trivy-reports
