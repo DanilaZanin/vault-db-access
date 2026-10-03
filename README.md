@@ -255,6 +255,11 @@ Residual risks you must know about:
   `make up-release` is `docker compose -f docker-compose.yml -f compose.release.yml ...`. Checked for v0.1.0:
   both signatures verify, and a fresh clone with the two digests reaches a healthy portal in about 2.5 minutes.
 
+## Companion tool
+
+[vault-map](https://github.com/DanilaZanin/vault-map) prints which KV paths a Vault token can list and what it may do on each
+path, without reading any secret. It is a quick way to check what the portal's service identity, or any other token, can see.
+
 ## What it does not do yet (ideas for v0.2)
 
 - OIDC / SSO with groups mapped to databases (today: Vault userpass accounts with the `db-access-admin` policy).
